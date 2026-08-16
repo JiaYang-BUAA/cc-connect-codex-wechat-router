@@ -58,6 +58,15 @@ try {
     Get-Process -Name 'cc-connect' -ErrorAction SilentlyContinue |
         Stop-Process -Force -ErrorAction SilentlyContinue
 
+    # Stopping cc-connect also terminates its child Codex app-server. That can
+    # emit an expected ERROR entry, so only validate logs written after the old
+    # daemon has fully stopped.
+    $DaemonLogOffset = if (Test-Path -LiteralPath $DaemonLog) {
+        (Get-Item -LiteralPath $DaemonLog).Length
+    } else {
+        0
+    }
+
     Copy-Item -LiteralPath $Source -Destination $Target -Force
     $Installed = $true
     Start-ScheduledTask -TaskName $ConnectorTask

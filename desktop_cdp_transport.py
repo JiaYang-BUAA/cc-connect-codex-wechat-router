@@ -34,17 +34,24 @@ def select_primary_codex_target(targets: list[dict[str, Any]]) -> dict[str, Any]
     return candidates[0]
 
 
-def build_follow_up_expression(thread_id: str, prompt: str) -> str:
+def build_follow_up_expression(
+    thread_id: str,
+    prompt: str,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+) -> str:
+    request_payload: dict[str, Any] = {
+        "hostId": "local",
+        "conversationId": thread_id,
+        "messageMetadata": None,
+        "prompt": prompt,
+    }
+    if model:
+        request_payload["model"] = model
+    if reasoning_effort:
+        request_payload["reasoningEffort"] = reasoning_effort
     payload = json.dumps(
-        {
-            "hostId": "local",
-            "conversationId": thread_id,
-            "messageMetadata": None,
-            "model": None,
-            "prompt": prompt,
-            "reasoningEffort": None,
-            "serviceTier": None,
-        },
+        request_payload,
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -202,5 +209,13 @@ class DesktopCdpClient:
     def probe(self) -> dict[str, Any]:
         return self.evaluate(build_probe_expression())
 
-    def send_follow_up(self, thread_id: str, prompt: str) -> dict[str, Any]:
-        return self.evaluate(build_follow_up_expression(thread_id, prompt))
+    def send_follow_up(
+        self,
+        thread_id: str,
+        prompt: str,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> dict[str, Any]:
+        return self.evaluate(
+            build_follow_up_expression(thread_id, prompt, model, reasoning_effort)
+        )

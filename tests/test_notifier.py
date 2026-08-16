@@ -103,6 +103,29 @@ codex_quote_router_token = "test-secret-token"
             loaded = notifier.load_config(path)
             self.assertEqual(loaded["codex_submit_transport"], "desktop-cdp")
 
+    def test_desktop_submit_uses_target_thread_model_preferences(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, config = self.make_fixture(root)
+            config.update(
+                {
+                    "codex_submit_transport": "desktop-cdp",
+                    "codex_desktop_cdp_url": "http://127.0.0.1:9335",
+                    "codex_desktop_cdp_timeout_seconds": 3,
+                }
+            )
+            client = mock.MagicMock()
+            client.send_follow_up.return_value = {"requestExport": "request"}
+            with mock.patch.object(notifier, "DesktopCdpClient", return_value=client):
+                ok, _ = notifier.submit_desktop_reply(config, "thread-1", "继续")
+            self.assertTrue(ok)
+            client.send_follow_up.assert_called_once_with(
+                "thread-1",
+                "继续",
+                model="gpt-5.6-sol",
+                reasoning_effort="high",
+            )
+
     def test_app_server_uses_independent_request_timeout(self):
         process = mock.MagicMock()
         process.stdout = []
@@ -160,13 +183,25 @@ codex_quote_router_token = "test-secret-token"
                 is_pinned integer,
                 archived integer,
                 thread_source text,
-                source text
+                source text,
+                model text,
+                reasoning_effort text
             )
             """
         )
         db.execute(
-            "insert into threads values (?, ?, ?, ?, ?, ?, ?)",
-            ("thread-1", "测试任务", str(rollout), 1, 0, "user", "vscode"),
+            "insert into threads values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "thread-1",
+                "测试任务",
+                str(rollout),
+                1,
+                0,
+                "user",
+                "vscode",
+                "gpt-5.6-sol",
+                "high",
+            ),
         )
         db.commit()
         db.close()

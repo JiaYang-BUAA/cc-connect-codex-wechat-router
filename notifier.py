@@ -266,7 +266,7 @@ def read_desktop_threads(config: dict[str, Any]) -> list[dict[str, Any]]:
         return []
     placeholders = ",".join("?" for _ in sources)
     sql = f"""
-        SELECT id, title, rollout_path, is_pinned
+        SELECT id, title, rollout_path, is_pinned, model, reasoning_effort
         FROM threads
         WHERE archived = 0
           AND rollout_path IS NOT NULL
@@ -310,7 +310,8 @@ def read_desktop_thread(config: dict[str, Any], thread_id: str) -> dict[str, Any
         return None
     placeholders = ",".join("?" for _ in sources)
     sql = f"""
-        SELECT id, title, rollout_path, is_pinned, archived, source, thread_source
+        SELECT id, title, rollout_path, is_pinned, archived, source, thread_source,
+               model, reasoning_effort
         FROM threads
         WHERE id = ?
           AND source IN ({placeholders})
@@ -977,7 +978,14 @@ def run_codex_reply(
                 str(config["codex_desktop_cdp_url"]),
                 float(config["codex_desktop_cdp_timeout_seconds"]),
             )
-            client.send_follow_up(thread_id, reply)
+            client.send_follow_up(
+                thread_id,
+                reply,
+                model=str((thread or {}).get("model") or "") or None,
+                reasoning_effort=(
+                    str((thread or {}).get("reasoning_effort") or "") or None
+                ),
+            )
             turn_id = wait_for_desktop_turn_completion(
                 rollout_path,
                 previous_turn_id,
@@ -1109,11 +1117,19 @@ def submit_desktop_reply(
     if config.get("codex_submit_transport") != "desktop-cdp":
         return False, "Codex Desktop submit transport is disabled"
     try:
+        thread = read_desktop_thread(config, thread_id)
+        if thread is None:
+            return False, "target Codex Desktop task was not found"
         client = DesktopCdpClient(
             str(config["codex_desktop_cdp_url"]),
             float(config["codex_desktop_cdp_timeout_seconds"]),
         )
-        result = client.send_follow_up(thread_id, reply)
+        result = client.send_follow_up(
+            thread_id,
+            reply,
+            model=str(thread.get("model") or "") or None,
+            reasoning_effort=str(thread.get("reasoning_effort") or "") or None,
+        )
         return True, str(result.get("requestExport") or "desktop-cdp")
     except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
         return False, str(exc)

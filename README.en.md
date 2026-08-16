@@ -1,6 +1,6 @@
 # Codex Pinned WeChat Notifier
 
-[简体中文](README.zh-CN.md)
+[简体中文](README.md)
 
 [![Tests](https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/actions/workflows/tests.yml/badge.svg)](https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/actions/workflows/tests.yml)
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)

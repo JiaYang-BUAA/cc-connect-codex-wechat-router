@@ -1,6 +1,6 @@
 # Codex 置顶任务微信通知器
 
-[English](README.md)
+[English](README.en.md)
 
 [![Tests](https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/actions/workflows/tests.yml/badge.svg)](https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/actions/workflows/tests.yml)
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -158,5 +158,5 @@ pwsh -NoProfile -File .\tools\check-public-repo.ps1
 `config.json`、`data/`、`logs/`、构建产物和旧本机部署脚本已由 `.gitignore`
 排除。公开发布前仍应检查 `git status --ignored`，不要提交真实令牌或路径。
 
-详见 [README.md](README.md)、[SECURITY.md](SECURITY.md) 和 [NOTICE.md](NOTICE.md)。
+详见 [README.en.md](README.en.md)、[SECURITY.md](SECURITY.md) 和 [NOTICE.md](NOTICE.md)。
 提交改动前请同时阅读 [CONTRIBUTING.md](CONTRIBUTING.md)；版本变化见 [CHANGELOG.md](CHANGELOG.md)。

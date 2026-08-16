@@ -8,6 +8,7 @@ logs/
 
 # Python and editor artifacts
 __pycache__/
+.cache/
 *.py[cod]
 .pytest_cache/
 .venv/

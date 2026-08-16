@@ -1,0 +1,27 @@
+# Local configuration and runtime state
+config.json
+data/
+logs/
+*.log
+*.sqlite
+*.sqlite-*
+
+# Python and editor artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.mypy_cache/
+.ruff_cache/
+.vscode/
+
+# Local build/deployment output
+artifacts/
+backups/
+*.exe
+*.sha256
+
+# Historical machine-specific deployment scripts
+deploy-quote-router-v7.ps1
+deploy-quote-router-v8.ps1
+deploy-quote-router-v9.ps1

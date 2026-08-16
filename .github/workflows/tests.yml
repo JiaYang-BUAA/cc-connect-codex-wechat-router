@@ -1,0 +1,20 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run unit tests
+        shell: pwsh
+        run: python -m unittest discover -s tests -v
+      - name: Scan tracked files for local secrets and paths
+        shell: pwsh
+        run: .\tools\check-public-repo.ps1

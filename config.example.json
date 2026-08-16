@@ -1,0 +1,16 @@
+{
+  "codex_db": "C:\\Users\\YOUR_USER\\.codex\\state_5.sqlite",
+  "cc_connect": "C:\\Path\\To\\cc-connect.exe",
+  "cc_project": "YOUR_CC_PROJECT",
+  "codex_cli": "C:\\Path\\To\\codex.exe",
+  "allowed_sources": ["vscode"],
+  "state_file": "C:\\Path\\To\\cc-connect-codex-notifier\\data\\state.json",
+  "log_file": "C:\\Path\\To\\cc-connect-codex-notifier\\logs\\notifier.log",
+  "router_enabled": true,
+  "router_host": "127.0.0.1",
+  "router_port": 18765,
+  "router_token": "GENERATE_A_LONG_RANDOM_TOKEN",
+  "codex_submit_transport": "desktop-cdp",
+  "codex_desktop_cdp_url": "http://127.0.0.1:9335",
+  "reply_retry_limit": 5
+}

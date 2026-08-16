@@ -2,6 +2,10 @@
 
 [简体中文](README.zh-CN.md)
 
+[![Tests](https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/actions/workflows/tests.yml/badge.svg)](https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/actions/workflows/tests.yml)
+[![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Windows](https://img.shields.io/badge/platform-Windows-0078D4.svg)](https://www.microsoft.com/windows)
+
 Windows companion service for `cc-connect` and Codex Desktop. It sends final
 answers from currently pinned Codex Desktop tasks to an existing Weixin
 session, then routes quoted replies back to the matching task.
@@ -9,6 +13,9 @@ session, then routes quoted replies back to the matching task.
 This repository does not contain credentials, Codex databases, transcripts, or
 the upstream cc-connect source. It requires a custom cc-connect build with the
 routing changes from the author's `quote-router` branch.
+
+> Current stable pair: notifier `1.1.0` and cc-connect routing patch
+> `v1.4.1+qr3`.
 
 ## Features
 
@@ -19,6 +26,7 @@ routing changes from the author's `quote-router` branch.
 - Quoting a queue acknowledgement and replying `/y` directly submits the
   original queued message.
 - `/rwpush` toggles final-answer push notifications.
+- `/hp` shows an in-Weixin, beginner-friendly usage guide.
 - Quoted Weixin voice messages use Weixin's recognized text.
 - Durable queues, retry backoff, duplicate suppression, loopback-only routing,
   and health/self-test endpoints.
@@ -35,13 +43,15 @@ routing changes from the author's `quote-router` branch.
 1. Copy `config.example.json` to `config.json` and replace every placeholder.
    Generate a long random `router_token`; use the same value in cc-connect's
    `codex_quote_router_token` option.
-2. Verify the configuration without starting the service:
+2. Set cc-connect's `codex_quote_router_url` to
+   `http://127.0.0.1:18765/route`.
+3. Verify the configuration without starting the service:
 
    ```powershell
    python .\notifier.py --config .\config.json --selftest
    ```
 
-3. Register the per-user scheduled task:
+4. Register the per-user scheduled task:
 
    ```powershell
    pwsh -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 `
@@ -51,6 +61,9 @@ routing changes from the author's `quote-router` branch.
 The first run establishes a file-offset baseline and does not resend historical
 answers. Runtime state is written to the configured `data` path.
 
+After installation, send `/rw` in Weixin. A pinned-task list confirms that the
+notifier, local router, and Weixin response path are connected.
+
 ## Weixin Commands
 
 ```text
@@ -58,7 +71,7 @@ answers. Runtime state is written to the configured `data` path.
 /rw3 内容                   Queue or submit content to pinned task 3
 /rw3 /y 内容                Directly submit content to pinned task 3
 /rwpush                    Toggle final-answer push notifications
-/hp                        Show the compact usage guide
+/hp                        Show the detailed usage guide
 ```
 
 ## Usage Guide
@@ -147,6 +160,9 @@ pwsh -NoProfile -File .\tools\check-public-repo.ps1
 The GitHub Actions workflow runs both checks on Windows. Keep local
 `config.json`, `data/`, and `logs/` untracked.
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a change and
+[CHANGELOG.md](CHANGELOG.md) for version history.
+
 ## Custom cc-connect Build
 
 The Go changes live in the companion fork's `quote-router` branch, based on
@@ -181,6 +197,21 @@ The notifier never exposes the router outside loopback and does not log answer
 bodies or credentials. The Desktop pinned order is read from
 `.codex-global-state.json`; numbering is current-state numbering, not a
 permanent task identifier.
+
+## Troubleshooting
+
+- **`/rw` reports no pinned tasks:** pin at least one unarchived task in Codex
+  Desktop. Tasks created only inside cc-connect are not part of this list.
+- **Commands receive no response:** verify the `cc-connect` and
+  `Codex Pinned WeChat Notifier` scheduled tasks, run `--selftest`, then inspect
+  the notifier and daemon logs.
+- **A quote cannot be routed:** quote the complete final-answer notification,
+  or use `/rw<number> content` as a fallback.
+- **Different spacing on mobile and desktop:** Weixin clients collapse blank
+  lines differently. The notifier optimizes the notification for mobile.
+
+When reporting a problem, remove router tokens, full user IDs, answer bodies,
+database contents, and machine-specific paths from logs and screenshots.
 
 ## Publishing
 

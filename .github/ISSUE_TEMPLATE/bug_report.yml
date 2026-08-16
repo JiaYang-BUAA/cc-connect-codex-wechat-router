@@ -1,0 +1,51 @@
+name: Bug report
+description: Report a reproducible notifier or Weixin routing problem
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Remove tokens, full user IDs, answer bodies, database contents, and
+        machine-specific paths before submitting.
+  - type: input
+    id: notifier-version
+    attributes:
+      label: Notifier version
+      placeholder: 1.1.0
+    validations:
+      required: true
+  - type: input
+    id: cc-connect-version
+    attributes:
+      label: cc-connect version
+      placeholder: v1.4.1+qr3
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: List the exact commands and actions that reproduce the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and sanitized logs
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed credentials, personal identifiers, answer contents, and local database data.
+          required: true

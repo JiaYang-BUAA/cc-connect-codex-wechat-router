@@ -58,6 +58,7 @@ answers. Runtime state is written to the configured `data` path.
 /rw3 内容                   Queue or submit content to pinned task 3
 /rw3 /y 内容                Directly submit content to pinned task 3
 /rwpush                    Toggle final-answer push notifications
+/hp                        Show the compact usage guide
 ```
 
 ## Usage Guide

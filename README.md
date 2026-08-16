@@ -1,226 +1,162 @@
-# Codex Pinned WeChat Notifier
+# Codex 置顶任务微信通知器
 
-[简体中文](README.zh-CN.md)
+[English](README.md)
 
 [![Tests](https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/actions/workflows/tests.yml/badge.svg)](https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/actions/workflows/tests.yml)
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Windows](https://img.shields.io/badge/platform-Windows-0078D4.svg)](https://www.microsoft.com/windows)
 
-Windows companion service for `cc-connect` and Codex Desktop. It sends final
-answers from currently pinned Codex Desktop tasks to an existing Weixin
-session, then routes quoted replies back to the matching task.
+这是 `cc-connect` 与 Codex Desktop 的 Windows 本机伴随服务。它把置顶
+Codex 任务的最终答复推送到既有微信会话，并把微信的引用回复路由回原任务。
 
-This repository does not contain credentials, Codex databases, transcripts, or
-the upstream cc-connect source. It requires a custom cc-connect build with the
-routing changes from the author's `quote-router` branch.
+本仓库不包含任何令牌、数据库、任务记录、微信会话或 cc-connect 上游源码。
+cc-connect 的定制 Go 改动维护在作者 fork 的 `quote-router` 分支，基于上游
+`v1.4.1`。
 
-> Current stable pair: notifier `1.1.0` and cc-connect routing patch
-> `v1.4.1+qr3`.
+> 当前稳定版本：通知器 `1.1.0`，配套 cc-connect 路由补丁 `v1.4.1+qr3`。
 
-## Features
+## 功能
 
-- Pushes only final answers from pinned, unarchived Desktop user tasks.
-- `/rw` lists pinned tasks in current sidebar order and runtime status.
-- `/rw3 内容` routes to pinned task 3; `/rw3 /y 内容` submits directly.
-- Quoted normal replies queue while a task is active.
-- Quoting a queue acknowledgement and replying `/y` directly submits the
-  original queued message.
-- `/rwpush` toggles final-answer push notifications.
-- `/hp` shows an in-Weixin, beginner-friendly usage guide.
-- Quoted Weixin voice messages use Weixin's recognized text.
-- Durable queues, retry backoff, duplicate suppression, loopback-only routing,
-  and health/self-test endpoints.
+- 仅推送置顶、未归档的 Codex Desktop 用户任务最终答复。
+- `/rw` 显示当前置顶顺序、运行时长和排队数。
+- `/rw3 内容` 投递到当前第 3 个置顶任务；`/rw3 /y 内容` 直接提交。
+- 引用最终答复时，任务运行中默认排队；引用排队提示回复 `/y` 可直接提交原消息。
+- `/rwpush` 开关最终答复推送；引用语音使用微信识别出的文本。
+- `/hp` 在微信内显示面向新手的完整操作指南。
+- 持久化队列、退避重试、去重、仅回环 HTTP 路由和健康检查。
 
-## Requirements
+## 运行要求
 
-- Windows 10/11, PowerShell 7 recommended.
-- Python 3.11 or newer. Runtime code uses only the standard library.
-- Codex Desktop with its local task database and CDP endpoint enabled.
-- `cc-connect` configured with the Weixin platform and matching router token.
+- Windows 10 或 Windows 11。
+- Python 3.11 或更高版本；通知器运行时只使用 Python 标准库。
+- 已登录的 Codex Desktop，且本机任务数据库和 CDP 调试端点可用。
+- 已配置微信平台的 `cc-connect`，并使用配套 `quote-router` 构建。
+- PowerShell 7 推荐用于安装、构建和诊断脚本。
 
-## Install
+## 快速开始
 
-1. Copy `config.example.json` to `config.json` and replace every placeholder.
-   Generate a long random `router_token`; use the same value in cc-connect's
-   `codex_quote_router_token` option.
-2. Set cc-connect's `codex_quote_router_url` to
-   `http://127.0.0.1:18765/route`.
-3. Verify the configuration without starting the service:
+1. 将 `config.example.json` 复制为 `config.json`，填写全部占位符。
+2. 生成长度至少 32 字节的随机 `router_token`，同时配置到 cc-connect 微信平台的
+   `codex_quote_router_token`。
+3. 将 cc-connect 的 `codex_quote_router_url` 设置为
+   `http://127.0.0.1:18765/route`，并确认两处令牌完全一致。
+4. 先自检：
 
    ```powershell
    python .\notifier.py --config .\config.json --selftest
    ```
 
-4. Register the per-user scheduled task:
+5. 注册登录后启动的计划任务：
 
    ```powershell
    pwsh -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 `
      -ConfigPath (Join-Path $PWD 'config.json')
    ```
 
-The first run establishes a file-offset baseline and does not resend historical
-answers. Runtime state is written to the configured `data` path.
+首次运行只建立偏移基线，不补发历史消息。
 
-After installation, send `/rw` in Weixin. A pinned-task list confirms that the
-notifier, local router, and Weixin response path are connected.
+安装完成后，在微信发送 `/rw`。能看到置顶任务列表即表示状态路由、微信回复和通知器均已连通。
 
-## Weixin Commands
+## 微信命令
 
 ```text
-/rw                         Show pinned task order and status
-/rw3 内容                   Queue or submit content to pinned task 3
-/rw3 /y 内容                Directly submit content to pinned task 3
-/rwpush                    Toggle final-answer push notifications
-/hp                        Show the detailed usage guide
+/rw                         查看置顶任务
+/rw3 内容                   向第 3 个置顶任务提交内容
+/rw3 /y 内容                向第 3 个置顶任务直接提交内容
+/rwpush                     开关最终答复推送
+/hp                         查看详细使用指南
 ```
 
-## Usage Guide
+## 使用指南
 
-### First-time setup
+### 首次使用
 
-1. Sign in to Codex Desktop and pin the tasks you want to operate from Weixin.
-2. Make sure both `cc-connect` and this notifier are running. Use
-   `notifier.py --selftest` to validate configuration and the loopback router.
-3. Send `/rw` in Weixin. The notifier lists pinned tasks in the current Codex
-   Desktop sidebar order, including task number, runtime status, and elapsed
-   time.
-4. Use the displayed number with `/rw<number> content` to send a new message
-   to a specific pinned task.
+1. 确认 Codex Desktop 已登录，并已经置顶需要通过微信操作的任务。
+2. 确认 `cc-connect` 和本通知器都已启动；可运行 `notifier.py --selftest` 检查配置和本地路由。
+3. 在微信中发送 `/rw`。通知器会按 Codex Desktop 当前侧边栏的置顶顺序列出任务编号、运行状态和运行时长。
+4. 记住任务编号后，可以用 `/rw编号 内容` 直接向该任务发送新消息。
 
-### Check task status
+### 查看状态
 
-`/rw` shows every currently pinned task. A running task shows its processing
-   time; an idle task shows `空闲`. If no tasks are pinned, the response says so.
-   Numbers follow the current pinned order and can change when tasks are
-   unpinned or archived.
+发送 `/rw` 可以查看所有置顶任务。运行中的任务显示当前处理时间，未运行的任务显示“空闲”；没有置顶任务时会明确提示当前没有置顶任务。编号按当前置顶顺序计算，任务取消置顶或归档后，编号可能变化。
 
-### Reply to a final answer
+### 回复 Codex 最终答复
 
-When a notification beginning with `【聊天名称】` arrives, quote the complete
-   notification and send your reply. Idle tasks accept it immediately. Replies
-   to active tasks are queued by default, and Weixin reports how many messages
-   are ahead in the queue.
+收到形如“【聊天名称】”的最终答复通知后，直接引用整条通知并发送文字即可。任务空闲时会立即提交；任务正在处理时，消息默认进入队列，微信会返回前方排队数量。
 
-Prefix a message with `/y` to submit it directly, for example:
+如果需要跳过队列，在消息前加 `/y`，例如 `/y 请优先检查这个错误`。直接提交失败时，系统会自动退回队列，不会丢失消息。
+
+排队确认消息也可以被引用，引用后只发送 `/y`，即可把原来排队的那条消息改为直接提交。引用内容必须是完整的通知或排队确认；无法识别时，系统会提示重新引用最近一次完整 Codex 答复。
+
+### 按编号继续对话
+
+当历史通知不方便查找时，使用 `/rw编号 内容`，例如：
 
 ```text
-/y Please inspect this error first
+/rw3 请根据上一版结果继续分析
 ```
 
-If direct submission fails, the notifier automatically falls back to the
-   queue so the message is not lost.
+这会把消息发送到当前第 3 个置顶任务。需要直接提交时使用 `/rw3 /y 内容`。如果编号对应的任务已取消置顶或归档，系统会提示无法继续回复。
 
-You can also quote a queue acknowledgement and send only `/y` to promote the
-   original queued message to direct submission. The quoted content must be a
-   complete Codex notification or queue acknowledgement. Unrecognized quotes
-   receive a prompt to quote the latest complete answer again.
+### 控制通知推送
 
-### Continue by pinned-task number
+发送 `/rwpush` 可切换最终答复推送开关。微信会返回“置顶任务回复推送已开启”或“置顶任务回复推送已关闭”。关闭推送只影响最终答复通知，不会停止 Codex 任务、清空队列或禁用微信提交。
 
-Use `/rw<number> content` when the older notification is difficult to find:
+## 工作原理
 
 ```text
-/rw3 Continue the analysis using the previous result
+Codex Desktop 数据库和任务记录
+             |
+         notifier.py ---- 本机 HTTP 路由（仅 127.0.0.1）
+             |                         |
+       最终答复推送              微信引用和命令
+             |                         |
+             +------ cc-connect ------+
 ```
 
-This routes the message to the current third pinned task. Use `/rw3 /y content`
-   for direct submission. If the task is no longer pinned or has been archived,
-   the notifier reports that it cannot continue the conversation.
+通知器从 Codex Desktop 的全局状态读取当前置顶顺序。编号是实时顺序，不是任务的永久 ID。路由服务只监听回环地址，答复正文和访问令牌不会写入日志。
 
-### Control final-answer notifications
+## 常见问题
 
-Send `/rwpush` to toggle final-answer push notifications. The response is
-   either “置顶任务回复推送已开启” or “置顶任务回复推送已关闭”. This toggle
-   affects notifications only; it does not stop Codex tasks, clear queues, or
-   disable Weixin submissions.
+### `/rw` 显示没有置顶任务
 
-When a quoted reply is sent to a final answer, ordinary text queues if the task
-is processing. Prefix new content with `/y` for direct submission. Queue
-acknowledgements say:
+先在 Codex Desktop 侧边栏置顶至少一个未归档任务，然后等待数秒再试。置顶顺序来自 Desktop 本地状态，不读取 cc-connect 自己创建的会话。
+
+### 微信命令没有反应
+
+确认两个计划任务都在运行：
+
+```powershell
+Get-ScheduledTask -TaskName 'cc-connect','Codex Pinned WeChat Notifier' |
+  Select-Object TaskName, State
+```
+
+随后运行自检，并检查 `logs/notifier.log` 与 `%USERPROFILE%\.cc-connect\logs\daemon.log`。不要在 Issue 中粘贴令牌、完整用户 ID、对话正文或本机数据库。
+
+### 引用后无法路由到原对话
+
+请引用完整的 Codex 最终答复通知。转发、手动复制或截断后的文本可能缺少路由指纹；这种情况下使用 `/rw编号 内容` 继续对话。
+
+### 手机和电脑微信换行不同
+
+微信不同客户端会压缩空行。通知器优先保证手机端可读，电脑端可能显示为较紧凑的段落，不影响路由。
+
+任务运行中排队时，提示为：
 
 ```text
 收到，已提交【聊天名称】，排队中（前方x条）。
 引用这条提示回复"/y"直接提交本条消息。
 ```
 
-## Development
-
-Run the complete test suite:
+## 开发与发布
 
 ```powershell
 python -m unittest discover -s tests -v
-```
-
-Run the publication safety check:
-
-```powershell
 pwsh -NoProfile -File .\tools\check-public-repo.ps1
 ```
 
-The GitHub Actions workflow runs both checks on Windows. Keep local
-`config.json`, `data/`, and `logs/` untracked.
+`config.json`、`data/`、`logs/`、构建产物和旧本机部署脚本已由 `.gitignore`
+排除。公开发布前仍应检查 `git status --ignored`，不要提交真实令牌或路径。
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a change and
-[CHANGELOG.md](CHANGELOG.md) for version history.
-
-## Custom cc-connect Build
-
-The Go changes live in the companion fork's `quote-router` branch, based on
-upstream `v1.4.1`. Build and deploy from that fork with explicit paths:
-
-```powershell
-pwsh -NoProfile -File .\build-quote-router.ps1 `
-  -SourceRoot 'C:\src\cc-connect' `
-  -OutputRoot (Join-Path $PWD 'artifacts') `
-  -PatchVersion 1
-pwsh -NoProfile -File .\deploy-quote-router.ps1 `
-  -SourceRoot (Join-Path $PWD 'artifacts') `
-  -NotifierConfig (Join-Path $PWD 'config.json') `
-  -PatchVersion 1
-```
-
-Deployment verifies executable version, SHA-256, loopback health, scheduled
-tasks, and new daemon log output. It keeps a timestamped backup and restores it
-if verification fails.
-
-## Architecture
-
-```text
-Codex Desktop DB/rollouts
-          |
-      notifier.py ---- loopback HTTP /status /task /route /toggle
-          |                                      |
-   Weixin send via cc-connect <--- custom cc-connect Weixin router
-```
-
-The notifier never exposes the router outside loopback and does not log answer
-bodies or credentials. The Desktop pinned order is read from
-`.codex-global-state.json`; numbering is current-state numbering, not a
-permanent task identifier.
-
-## Troubleshooting
-
-- **`/rw` reports no pinned tasks:** pin at least one unarchived task in Codex
-  Desktop. Tasks created only inside cc-connect are not part of this list.
-- **Commands receive no response:** verify the `cc-connect` and
-  `Codex Pinned WeChat Notifier` scheduled tasks, run `--selftest`, then inspect
-  the notifier and daemon logs.
-- **A quote cannot be routed:** quote the complete final-answer notification,
-  or use `/rw<number> content` as a fallback.
-- **Different spacing on mobile and desktop:** Weixin clients collapse blank
-  lines differently. The notifier optimizes the notification for mobile.
-
-When reporting a problem, remove router tokens, full user IDs, answer bodies,
-database contents, and machine-specific paths from logs and screenshots.
-
-## Publishing
-
-Before the first public push:
-
-1. Commit only source, tests, scripts, documentation, and the example config.
-2. Run the test and public-repository checks on a clean clone.
-3. Publish the cc-connect fork separately, preserving its upstream notices and
-   clearly describing the custom commits.
-
-See [SECURITY.md](SECURITY.md) and [NOTICE.md](NOTICE.md) for handling and
-upstream attribution guidance.
+详见 [README.md](README.md)、[SECURITY.md](SECURITY.md) 和 [NOTICE.md](NOTICE.md)。
+提交改动前请同时阅读 [CONTRIBUTING.md](CONTRIBUTING.md)；版本变化见 [CHANGELOG.md](CHANGELOG.md)。

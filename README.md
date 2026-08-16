@@ -60,6 +60,66 @@ answers. Runtime state is written to the configured `data` path.
 /rwpush                    Toggle final-answer push notifications
 ```
 
+## Usage Guide
+
+### First-time setup
+
+1. Sign in to Codex Desktop and pin the tasks you want to operate from Weixin.
+2. Make sure both `cc-connect` and this notifier are running. Use
+   `notifier.py --selftest` to validate configuration and the loopback router.
+3. Send `/rw` in Weixin. The notifier lists pinned tasks in the current Codex
+   Desktop sidebar order, including task number, runtime status, and elapsed
+   time.
+4. Use the displayed number with `/rw<number> content` to send a new message
+   to a specific pinned task.
+
+### Check task status
+
+`/rw` shows every currently pinned task. A running task shows its processing
+   time; an idle task shows `空闲`. If no tasks are pinned, the response says so.
+   Numbers follow the current pinned order and can change when tasks are
+   unpinned or archived.
+
+### Reply to a final answer
+
+When a notification beginning with `【聊天名称】` arrives, quote the complete
+   notification and send your reply. Idle tasks accept it immediately. Replies
+   to active tasks are queued by default, and Weixin reports how many messages
+   are ahead in the queue.
+
+Prefix a message with `/y` to submit it directly, for example:
+
+```text
+/y Please inspect this error first
+```
+
+If direct submission fails, the notifier automatically falls back to the
+   queue so the message is not lost.
+
+You can also quote a queue acknowledgement and send only `/y` to promote the
+   original queued message to direct submission. The quoted content must be a
+   complete Codex notification or queue acknowledgement. Unrecognized quotes
+   receive a prompt to quote the latest complete answer again.
+
+### Continue by pinned-task number
+
+Use `/rw<number> content` when the older notification is difficult to find:
+
+```text
+/rw3 Continue the analysis using the previous result
+```
+
+This routes the message to the current third pinned task. Use `/rw3 /y content`
+   for direct submission. If the task is no longer pinned or has been archived,
+   the notifier reports that it cannot continue the conversation.
+
+### Control final-answer notifications
+
+Send `/rwpush` to toggle final-answer push notifications. The response is
+   either “置顶任务回复推送已开启” or “置顶任务回复推送已关闭”. This toggle
+   affects notifications only; it does not stop Codex tasks, clear queues, or
+   disable Weixin submissions.
+
 When a quoted reply is sent to a final answer, ordinary text queues if the task
 is processing. Prefix new content with `/y` for direct submission. Queue
 acknowledgements say:

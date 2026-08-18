@@ -211,6 +211,43 @@ codex_quote_router_token = "test-secret-token"
         }
         return rollout, db_path, config
 
+    def configure_pinned_automation(
+        self, root: Path, db_path: Path, config: dict, automation_id: str = "daily"
+    ) -> None:
+        automations_dir = root / "automations"
+        definition_dir = automations_dir / automation_id
+        definition_dir.mkdir(parents=True)
+        (definition_dir / "automation.toml").write_text(
+            "\n".join(
+                [
+                    "version = 1",
+                    f'id = "{automation_id}"',
+                    'name = "每日总结"',
+                    'status = "ACTIVE"',
+                    'target_thread_id = "thread-1"',
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        global_state = root / ".codex-global-state.json"
+        global_state.write_text(
+            json.dumps({"pinned-thread-ids": ["thread-1"]}), encoding="utf-8"
+        )
+        config["codex_automations_dir"] = str(automations_dir)
+        config["codex_global_state"] = str(global_state)
+        db = sqlite3.connect(db_path)
+        db.execute(
+            "update threads set thread_source='automation', "
+            "title=? where id='thread-1'",
+            (
+                f"Automation: 每日总结\nAutomation ID: {automation_id}\n"
+                "Automation memory: memory.md",
+            ),
+        )
+        db.commit()
+        db.close()
+
     @staticmethod
     def append_completion(path: Path, turn_id: str, answer: str):
         item = {
@@ -294,6 +331,45 @@ codex_quote_router_token = "test-secret-token"
             )
             self.assertEqual(enabled, "置顶任务回复推送已开启")
             self.assertTrue(notifier.load_state(state_path)["push_enabled"])
+
+    def test_pinned_project_push_toggle_is_independent_and_persistent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, config = self.make_fixture(root)
+            config["handled_message_history_limit"] = 20
+            state_path = root / "state.json"
+            state = notifier.empty_state()
+            state["pending"] = [
+                {"turn_id": "exact", "pin_source": "pinned_thread"},
+                {"turn_id": "folder", "pin_source": "pinned_project"},
+            ]
+            lock = threading.RLock()
+
+            status, enabled = notifier.toggle_pinned_project_push(
+                config,
+                state,
+                state_path,
+                lock,
+                {"message_id": "m1", "user_id": "u1"},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(enabled, "置顶文件夹任务回复推送已开启")
+            self.assertTrue(state["pinned_project_push_enabled"])
+            self.assertEqual(len(state["pending"]), 2)
+
+            _, disabled = notifier.toggle_pinned_project_push(
+                config,
+                state,
+                state_path,
+                lock,
+                {"message_id": "m2", "user_id": "u1"},
+            )
+            self.assertEqual(disabled, "置顶文件夹任务回复推送已关闭")
+            self.assertFalse(state["pinned_project_push_enabled"])
+            self.assertEqual([item["turn_id"] for item in state["pending"]], ["exact"])
+            self.assertFalse(
+                notifier.load_state(state_path)["pinned_project_push_enabled"]
+            )
 
     def test_proactive_send_uses_explicit_wechat_session(self):
         config = {
@@ -382,6 +458,179 @@ codex_quote_router_token = "test-secret-token"
             )
             self.assertFalse(notifier.read_desktop_thread(config, "thread-1")["is_pinned"])
 
+    def test_pinned_automation_target_is_numbered_and_quote_replyable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, db_path, config = self.make_fixture(root)
+            self.configure_pinned_automation(root, db_path, config)
+
+            threads = notifier.read_desktop_threads(config)
+            self.assertEqual(len(threads), 1)
+            self.assertTrue(threads[0]["is_pinned"])
+            self.assertTrue(threads[0]["is_automation_target"])
+            self.assertEqual(threads[0]["title"], "每日总结")
+            self.assertIn(
+                "1. 【每日总结】空闲",
+                notifier.format_pinned_task_status(config, notifier.empty_state()),
+            )
+
+            state_path = root / "state.json"
+            state = notifier.empty_state()
+            message = "【每日总结】\n答复\n\n↩ 引用此条信息进行回复"
+            notifier.remember_quote_route(
+                state,
+                {"thread_id": "thread-1", "turn_id": "turn-1", "title": "每日总结"},
+                message,
+                20,
+            )
+            status, _ = notifier.enqueue_quote_reply(
+                config,
+                state,
+                state_path,
+                threading.RLock(),
+                {
+                    "quote_text": message,
+                    "reply_text": "继续总结",
+                    "message_id": "automation-reply",
+                    "user_id": "u1",
+                },
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(state["reply_queue"][0]["thread_id"], "thread-1")
+
+    def test_pinned_automation_run_baselines_history_and_routes_new_completion(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target_rollout, db_path, config = self.make_fixture(root)
+            self.configure_pinned_automation(root, db_path, config)
+            self.append_completion(target_rollout, "target-history", "目标历史答复")
+            run_rollout = root / "automation-run.jsonl"
+            self.append_completion(run_rollout, "historical-turn", "历史自动答复")
+            db = sqlite3.connect(db_path)
+            db.execute(
+                "insert into threads values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "automation-run-1",
+                    "Automation: 每日总结\nAutomation ID: daily",
+                    str(run_rollout),
+                    0,
+                    1,
+                    "automation",
+                    "vscode",
+                    "gpt-5.6-sol",
+                    "high",
+                ),
+            )
+            db.execute(
+                "insert into threads values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "stale-automation-run",
+                    "Automation: 旧任务名称\nAutomation ID: daily",
+                    str(root / "stale-run.jsonl"),
+                    0,
+                    1,
+                    "automation",
+                    "vscode",
+                    "gpt-5.6-sol",
+                    "high",
+                ),
+            )
+            db.commit()
+            db.close()
+
+            runs = notifier.read_automation_runs(config)
+            self.assertEqual([run["id"] for run in runs], ["automation-run-1"])
+
+            state = notifier.empty_state()
+            logger = notifier.logging.getLogger("test-automation-run")
+            self.assertEqual(notifier.poll_threads(config, state, logger), 0)
+            self.assertTrue(state["automation_runs_initialized"])
+            self.assertEqual(state["pending"], [])
+
+            Path(config["codex_global_state"]).write_text(
+                json.dumps({"pinned-thread-ids": []}), encoding="utf-8"
+            )
+            self.assertEqual(notifier.poll_threads(config, state, logger), 0)
+            Path(config["codex_global_state"]).write_text(
+                json.dumps({"pinned-thread-ids": ["thread-1"]}), encoding="utf-8"
+            )
+            self.assertEqual(notifier.poll_threads(config, state, logger), 0)
+
+            self.append_completion(run_rollout, "new-turn", "新的自动答复")
+            self.assertEqual(notifier.poll_threads(config, state, logger), 1)
+            pending = state["pending"][0]
+            self.assertEqual(pending["thread_id"], "thread-1")
+            self.assertEqual(pending["source_thread_id"], "automation-run-1")
+            self.assertEqual(pending["pin_source"], "pinned_automation")
+            self.assertEqual(pending["title"], "每日总结")
+
+    def test_pinned_project_membership_is_read_from_sidebar_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, db_path, config = self.make_fixture(root)
+            global_state = root / ".codex-global-state.json"
+            config["codex_global_state"] = str(global_state)
+            global_state.write_text(
+                json.dumps(
+                    {
+                        "pinned-thread-ids": [],
+                        "pinned-project-ids": ["project-1"],
+                        "thread-project-assignments": {
+                            "thread-1": {
+                                "projectKind": "local",
+                                "projectId": "project-1",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            db = sqlite3.connect(db_path)
+            db.execute("update threads set is_pinned=0 where id='thread-1'")
+            db.commit()
+            db.close()
+
+            thread = notifier.read_desktop_threads(config)[0]
+            self.assertFalse(thread["is_pinned"])
+            self.assertTrue(thread["is_project_pinned"])
+            self.assertTrue(
+                notifier.read_desktop_thread(config, "thread-1")["is_project_pinned"]
+            )
+
+    def test_project_thread_completion_is_queued_only_when_folder_push_is_on(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rollout, db_path, config = self.make_fixture(root)
+            global_state = root / ".codex-global-state.json"
+            config["codex_global_state"] = str(global_state)
+            global_state.write_text(
+                json.dumps(
+                    {
+                        "pinned-thread-ids": [],
+                        "pinned-project-ids": ["project-1"],
+                        "thread-project-assignments": {
+                            "thread-1": {"projectId": "project-1"}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            db = sqlite3.connect(db_path)
+            db.execute("update threads set is_pinned=0 where id='thread-1'")
+            db.commit()
+            db.close()
+            state = notifier.empty_state()
+            notifier.baseline_state(state, notifier.read_desktop_threads(config))
+            logger = notifier.logging.getLogger("test-project-push")
+
+            self.append_completion(rollout, "off-turn", "关闭时不发送")
+            self.assertEqual(notifier.poll_threads(config, state, logger), 0)
+            state["pinned_project_push_enabled"] = True
+            self.append_completion(rollout, "on-turn", "开启后发送")
+            self.assertEqual(notifier.poll_threads(config, state, logger), 1)
+            self.assertEqual(state["pending"][0]["turn_id"], "on-turn")
+            self.assertEqual(state["pending"][0]["pin_source"], "pinned_project")
+
     def test_chunking_preserves_answer(self):
         answer = "甲" * 1300
         chunks = notifier.split_answer("长任务", answer, 600)
@@ -449,6 +698,7 @@ codex_quote_router_token = "test-secret-token"
                 message = notifier.format_pinned_task_status(config, state)
             self.assertIn("【测试任务】运行中｜已处理", message)
             self.assertIn("排队 1", message)
+            self.assertIn("置顶文件夹推送：已关闭", message)
 
     def test_quote_route_matches_without_storing_answer(self):
         state = notifier.empty_state()
@@ -758,6 +1008,53 @@ codex_quote_router_token = "test-secret-token"
             )
             self.assertEqual(status, 409)
 
+    def test_enqueue_quote_reply_accepts_task_in_enabled_pinned_project(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, db_path, config = self.make_fixture(root)
+            config["codex_global_state"] = str(root / ".codex-global-state.json")
+            Path(config["codex_global_state"]).write_text(
+                json.dumps(
+                    {
+                        "pinned-thread-ids": [],
+                        "pinned-project-ids": ["project-1"],
+                        "thread-project-assignments": {
+                            "thread-1": {"projectId": "project-1"}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            db = sqlite3.connect(db_path)
+            db.execute("update threads set is_pinned=0 where id='thread-1'")
+            db.commit()
+            db.close()
+            state_path = root / "state.json"
+            state = notifier.empty_state()
+            state["pinned_project_push_enabled"] = True
+            message = "【文件夹任务】\n答复\n\n↩ 引用此条信息进行回复"
+            notifier.remember_quote_route(
+                state,
+                {"thread_id": "thread-1", "turn_id": "turn-1", "title": "文件夹任务"},
+                message,
+                20,
+            )
+
+            status, _ = notifier.enqueue_quote_reply(
+                config,
+                state,
+                state_path,
+                threading.RLock(),
+                {
+                    "quote_text": message,
+                    "reply_text": "继续处理",
+                    "message_id": "m-project",
+                    "user_id": "u1",
+                },
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(state["reply_queue"][0]["thread_id"], "thread-1")
+
     def test_default_reply_queues_while_task_is_active(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -772,18 +1069,23 @@ codex_quote_router_token = "test-secret-token"
                 message,
                 20,
             )
-            status, response = notifier.enqueue_quote_reply(
-                config,
-                state,
-                state_path,
-                threading.RLock(),
-                {
-                    "quote_text": message,
-                    "reply_text": "继续排队",
-                    "message_id": "m1",
-                    "user_id": "u1",
-                },
-            )
+            with mock.patch.object(
+                notifier,
+                "read_desktop_queued_follow_up_count",
+                return_value=0,
+            ):
+                status, response = notifier.enqueue_quote_reply(
+                    config,
+                    state,
+                    state_path,
+                    threading.RLock(),
+                    {
+                        "quote_text": message,
+                        "reply_text": "继续排队",
+                        "message_id": "m1",
+                        "user_id": "u1",
+                    },
+                )
             self.assertEqual(status, 200)
             self.assertEqual(
                 response,
@@ -972,6 +1274,107 @@ codex_quote_router_token = "test-secret-token"
             submit.assert_called_once_with(config, "thread-1", "直接补充")
             self.assertEqual(len(state["reply_queue"]), 1)
             self.assertEqual(state["reply_queue"][0]["status"], "queued")
+
+    def test_queue_count_includes_desktop_follow_ups(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rollout, _, config = self.make_fixture(root)
+            self.append_started(rollout, "active-turn")
+            state_path = root / "state.json"
+            state = notifier.empty_state()
+            message = "【科研】\n答复\n\n↩ 引用此条信息进行回复"
+            notifier.remember_quote_route(
+                state,
+                {"thread_id": "thread-1", "turn_id": "turn-1", "title": "科研"},
+                message,
+                20,
+            )
+
+            def desktop_count_before_enqueue(_config, thread_id):
+                self.assertEqual(thread_id, "thread-1")
+                self.assertEqual(state["reply_queue"], [])
+                return 1
+
+            with mock.patch.object(
+                notifier,
+                "read_desktop_queued_follow_up_count",
+                side_effect=desktop_count_before_enqueue,
+            ) as desktop_count:
+                status, response = notifier.enqueue_quote_reply(
+                    config,
+                    state,
+                    state_path,
+                    threading.RLock(),
+                    {
+                        "quote_text": message,
+                        "reply_text": "微信排队",
+                        "message_id": "m-desktop-ahead",
+                        "user_id": "u1",
+                    },
+                )
+
+            self.assertEqual(status, 200)
+            self.assertIn("排队中（前方1条）", response)
+            desktop_count.assert_called_once_with(config, "thread-1")
+
+    def test_queue_count_combines_desktop_and_wechat_follow_ups(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rollout, _, config = self.make_fixture(root)
+            self.append_started(rollout, "active-turn")
+            state_path = root / "state.json"
+            state = notifier.empty_state()
+            state["reply_queue"].append(
+                {
+                    "request_id": "wechat-ahead",
+                    "thread_id": "thread-1",
+                    "status": "queued",
+                }
+            )
+            message = "【科研】\n答复\n\n↩ 引用此条信息进行回复"
+            notifier.remember_quote_route(
+                state,
+                {"thread_id": "thread-1", "turn_id": "turn-1", "title": "科研"},
+                message,
+                20,
+            )
+
+            with mock.patch.object(
+                notifier,
+                "read_desktop_queued_follow_up_count",
+                return_value=1,
+            ):
+                status, response = notifier.enqueue_quote_reply(
+                    config,
+                    state,
+                    state_path,
+                    threading.RLock(),
+                    {
+                        "quote_text": message,
+                        "reply_text": "第二条微信排队",
+                        "message_id": "m-combined-ahead",
+                        "user_id": "u1",
+                    },
+                )
+
+            self.assertEqual(status, 200)
+            self.assertIn("排队中（前方2条）", response)
+
+    def test_desktop_queue_count_failure_falls_back_to_wechat_queue(self):
+        config = {
+            "codex_desktop_cdp_url": "http://127.0.0.1:9335",
+            "codex_desktop_cdp_timeout_seconds": 3,
+        }
+        client = mock.MagicMock()
+        client.get_queued_follow_up_count.side_effect = RuntimeError("unavailable")
+        with (
+            mock.patch.object(notifier, "DesktopCdpClient", return_value=client),
+            self.assertLogs("codex_pinned_wechat_notifier", level="WARNING"),
+        ):
+            count = notifier.read_desktop_queued_follow_up_count(
+                config, "thread-1"
+            )
+        self.assertEqual(count, 0)
 
     def test_y_prefix_steers_wechat_owned_active_turn(self):
         class FakeClient:

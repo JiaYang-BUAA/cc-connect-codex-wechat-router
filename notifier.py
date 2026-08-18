@@ -11,6 +11,7 @@ import msvcrt
 import os
 from pathlib import Path
 import queue
+import re
 import sqlite3
 import subprocess
 import sys
@@ -71,6 +72,10 @@ def load_config(path: Path) -> dict[str, Any]:
         "codex_catalog_db",
         str(Path(str(config["codex_db"])).with_name("sqlite") / "codex-dev.db"),
     )
+    config.setdefault(
+        "codex_automations_dir",
+        str(Path(str(config["codex_db"])).with_name("automations")),
+    )
     if config.get("router_enabled", True) and not config.get("codex_cli"):
         raise ValueError("Missing config key: codex_cli")
     if config["codex_app_server_transport"] not in {
@@ -118,6 +123,8 @@ def empty_state() -> dict[str, Any]:
         "reply_queue": [],
         "handled_message_ids": {},
         "push_enabled": True,
+        "pinned_project_push_enabled": False,
+        "automation_runs_initialized": False,
     }
 
 
@@ -147,6 +154,8 @@ def load_state(path: Path) -> dict[str, Any]:
     state.setdefault("reply_queue", [])
     state.setdefault("handled_message_ids", {})
     state.setdefault("push_enabled", True)
+    state.setdefault("pinned_project_push_enabled", False)
+    state.setdefault("automation_runs_initialized", False)
     for item in state["pending"]:
         if item.get("delivery_status") == "sending":
             item["delivery_status"] = "queued"
@@ -258,6 +267,63 @@ def format_duration(seconds: float) -> str:
     return f"{hours}小时{minutes:02d}分"
 
 
+def read_automation_definitions(config: dict[str, Any]) -> list[dict[str, str]]:
+    """Read Desktop automation metadata without depending on task titles."""
+    root = Path(str(config.get("codex_automations_dir") or ""))
+    if not root.is_dir():
+        return []
+    definitions: list[dict[str, str]] = []
+    try:
+        paths = sorted(root.glob("*/automation.toml"))
+    except OSError:
+        return []
+    for path in paths:
+        try:
+            with path.open("rb") as handle:
+                data = tomllib.load(handle)
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        automation_id = str(data.get("id") or path.parent.name).strip()
+        target_thread_id = str(data.get("target_thread_id") or "").strip()
+        if not automation_id or not target_thread_id:
+            continue
+        definitions.append(
+            {
+                "id": automation_id,
+                "name": str(data.get("name") or automation_id).strip() or automation_id,
+                "status": str(data.get("status") or "").strip(),
+                "target_thread_id": target_thread_id,
+            }
+        )
+    return definitions
+
+
+def automation_id_from_title(title: str) -> str:
+    match = re.search(r"(?im)^Automation ID:\s*([^\r\n]+)", title)
+    return match.group(1).strip() if match else ""
+
+
+def automation_name_from_title(title: str) -> str:
+    match = re.search(r"(?im)^Automation:\s*([^\r\n]+)", title)
+    return match.group(1).strip() if match else ""
+
+
+def apply_automation_metadata(
+    rows: list[dict[str, Any]], config: dict[str, Any]
+) -> None:
+    by_target = {
+        item["target_thread_id"]: item for item in read_automation_definitions(config)
+    }
+    for row in rows:
+        definition = by_target.get(str(row.get("id") or ""))
+        row["is_automation_target"] = definition is not None
+        if definition is None:
+            continue
+        row["automation_id"] = definition["id"]
+        row["automation_status"] = definition["status"]
+        row["title"] = definition["name"]
+
+
 def read_desktop_threads(config: dict[str, Any]) -> list[dict[str, Any]]:
     db_path = Path(config["codex_db"]).resolve()
     uri = db_path.as_uri() + "?mode=ro"
@@ -270,7 +336,7 @@ def read_desktop_threads(config: dict[str, Any]) -> list[dict[str, Any]]:
         FROM threads
         WHERE archived = 0
           AND rollout_path IS NOT NULL
-          AND thread_source = 'user'
+          AND thread_source IN ('user', 'automation')
           AND source IN ({placeholders})
     """
     db = sqlite3.connect(uri, uri=True, timeout=5)
@@ -280,19 +346,25 @@ def read_desktop_threads(config: dict[str, Any]) -> list[dict[str, Any]]:
         rows = [dict(row) for row in db.execute(sql, sources).fetchall()]
     finally:
         db.close()
-    pinned_ids = read_pinned_thread_ids(config)
+    pinned_ids, pinned_project_thread_ids = read_sidebar_pin_state(config)
     catalog_titles = read_catalog_titles(config, [str(row["id"]) for row in rows])
     for row in rows:
         display_title = catalog_titles.get(str(row["id"]))
         if display_title:
             row["title"] = display_title
+    apply_automation_metadata(rows, config)
     if pinned_ids is None:
+        for row in rows:
+            row["is_project_pinned"] = (
+                str(row["id"]) in pinned_project_thread_ids
+            )
         return rows
     pinned_index = {thread_id: index for index, thread_id in enumerate(pinned_ids)}
     for row in rows:
         thread_id = str(row["id"])
         row["is_pinned"] = thread_id in pinned_index
         row["pinned_index"] = pinned_index.get(thread_id)
+        row["is_project_pinned"] = thread_id in pinned_project_thread_ids
     rows.sort(
         key=lambda row: (
             0 if bool(row.get("is_pinned")) else 1,
@@ -300,6 +372,76 @@ def read_desktop_threads(config: dict[str, Any]) -> list[dict[str, Any]]:
         )
     )
     return rows
+
+
+def read_automation_runs(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return execution threads mapped to their current automation targets."""
+    definitions = read_automation_definitions(config)
+    if not definitions:
+        return []
+    pinned_ids, _ = read_sidebar_pin_state(config)
+    pinned = set(pinned_ids or [])
+    by_id = {item["id"]: item for item in definitions}
+
+    db_path = Path(config["codex_db"]).resolve()
+    uri = db_path.as_uri() + "?mode=ro"
+    sources = list(config["allowed_sources"])
+    if not sources:
+        return []
+    placeholders = ",".join("?" for _ in sources)
+    sql = f"""
+        SELECT id, title, rollout_path, archived, source, thread_source,
+               model, reasoning_effort
+        FROM threads
+        WHERE rollout_path IS NOT NULL
+          AND thread_source = 'automation'
+          AND source IN ({placeholders})
+    """
+    db = sqlite3.connect(uri, uri=True, timeout=5)
+    try:
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA query_only = ON")
+        rows = [dict(row) for row in db.execute(sql, sources).fetchall()]
+    finally:
+        db.close()
+
+    runs: list[dict[str, Any]] = []
+    for row in rows:
+        raw_title = str(row.get("title") or "")
+        automation_id = automation_id_from_title(raw_title)
+        definition = by_id.get(automation_id)
+        automation_name = automation_name_from_title(raw_title)
+        if (
+            definition is None
+            or automation_name != definition["name"]
+            or str(row["id"]) == definition["target_thread_id"]
+        ):
+            continue
+        row.update(
+            {
+                "automation_id": automation_id,
+                "is_automation_run": True,
+                "is_pinned": definition["target_thread_id"] in pinned,
+                "is_project_pinned": False,
+                "route_thread_id": definition["target_thread_id"],
+                "title": definition["name"],
+            }
+        )
+        runs.append(row)
+    return runs
+
+
+def read_pinned_automation_runs(config: dict[str, Any]) -> list[dict[str, Any]]:
+    return [row for row in read_automation_runs(config) if bool(row.get("is_pinned"))]
+
+
+def read_monitored_threads(
+    config: dict[str, Any], state: dict[str, Any]
+) -> list[dict[str, Any]]:
+    threads = {str(row["id"]): row for row in read_desktop_threads(config)}
+    for row in read_automation_runs(config):
+        threads[str(row["id"])] = row
+    return list(threads.values())
 
 
 def read_desktop_thread(config: dict[str, Any], thread_id: str) -> dict[str, Any] | None:
@@ -329,9 +471,11 @@ def read_desktop_thread(config: dict[str, Any], thread_id: str) -> dict[str, Any
     display_title = read_catalog_titles(config, [thread_id]).get(thread_id)
     if display_title:
         result["title"] = display_title
-    pinned_ids = read_pinned_thread_ids(config)
+    apply_automation_metadata([result], config)
+    pinned_ids, pinned_project_thread_ids = read_sidebar_pin_state(config)
     if pinned_ids is not None:
         result["is_pinned"] = thread_id in set(pinned_ids)
+    result["is_project_pinned"] = thread_id in pinned_project_thread_ids
     return result
 
 
@@ -414,8 +558,8 @@ def recover_interrupted_reply_requests(
     return recovered, requeued
 
 
-def read_pinned_thread_ids(config: dict[str, Any]) -> list[str] | None:
-    """Read the Codex Desktop sidebar's authoritative pinned task order."""
+def read_desktop_global_state(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Read Codex Desktop's global sidebar state, falling back to its backup."""
     configured = config.get("codex_global_state")
     if configured:
         state_path = Path(str(configured))
@@ -428,18 +572,66 @@ def read_pinned_thread_ids(config: dict[str, Any]) -> list[str] | None:
                 data = json.load(handle)
         except (OSError, json.JSONDecodeError):
             continue
-        raw_ids = data.get("pinned-thread-ids")
-        if not isinstance(raw_ids, list):
-            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def read_sidebar_pin_state(
+    config: dict[str, Any],
+) -> tuple[list[str] | None, set[str]]:
+    """Return exact pinned order and threads belonging to pinned projects."""
+    data = read_desktop_global_state(config)
+    if data is None:
+        return None, set()
+
+    raw_ids = data.get("pinned-thread-ids")
+    pinned_ids: list[str] | None = None
+    if isinstance(raw_ids, list):
         seen: set[str] = set()
-        result: list[str] = []
+        pinned_ids = []
         for raw_id in raw_ids:
             thread_id = str(raw_id).strip()
             if thread_id and thread_id not in seen:
                 seen.add(thread_id)
-                result.append(thread_id)
-        return result
-    return None
+                pinned_ids.append(thread_id)
+
+    raw_project_ids = data.get("pinned-project-ids")
+    pinned_project_ids = (
+        {
+            str(project_id).strip()
+            for project_id in raw_project_ids
+            if str(project_id).strip()
+        }
+        if isinstance(raw_project_ids, list)
+        else set()
+    )
+    assignments = data.get("thread-project-assignments")
+    project_thread_ids: set[str] = set()
+    if pinned_project_ids and isinstance(assignments, dict):
+        for raw_thread_id, assignment in assignments.items():
+            if isinstance(assignment, dict):
+                project_id = str(assignment.get("projectId") or "").strip()
+            else:
+                project_id = str(assignment or "").strip()
+            thread_id = str(raw_thread_id).strip()
+            if thread_id and project_id in pinned_project_ids:
+                project_thread_ids.add(thread_id)
+    return pinned_ids, project_thread_ids
+
+
+def read_pinned_thread_ids(config: dict[str, Any]) -> list[str] | None:
+    """Read the Codex Desktop sidebar's authoritative pinned task order."""
+    pinned_ids, _ = read_sidebar_pin_state(config)
+    return pinned_ids
+
+
+def thread_push_is_enabled(thread: dict[str, Any], state: dict[str, Any]) -> bool:
+    if bool(thread.get("is_pinned")):
+        return True
+    return bool(state.get("pinned_project_push_enabled", False)) and bool(
+        thread.get("is_project_pinned")
+    )
 
 
 def read_catalog_titles(config: dict[str, Any], thread_ids: list[str]) -> dict[str, str]:
@@ -480,16 +672,36 @@ def format_pinned_task_status(
     state: dict[str, Any],
     active_sessions: dict[str, dict[str, Any]] | None = None,
 ) -> str:
-    pinned = [thread for thread in read_desktop_threads(config) if bool(thread.get("is_pinned"))]
+    threads = read_desktop_threads(config)
+    pinned = [thread for thread in threads if bool(thread.get("is_pinned"))]
+    project_count = sum(bool(thread.get("is_project_pinned")) for thread in threads)
+    project_push = bool(state.get("pinned_project_push_enabled", False))
+    project_line = (
+        f"置顶文件夹推送：{'已开启' if project_push else '已关闭'}"
+        + (f"（当前 {project_count} 个对话）" if project_push else "")
+    )
     if not pinned:
-        return "当前没有置顶任务。"
+        return f"当前没有单独置顶任务。\n{project_line}"
     active_sessions = active_sessions or {}
     now = time.time()
-    lines = [f"置顶任务（{len(pinned)}）"]
+    automation_runtimes: dict[str, dict[str, Any]] = {}
+    for run in read_pinned_automation_runs(config):
+        runtime = latest_thread_runtime(str(run.get("rollout_path") or ""))
+        if not runtime.get("active"):
+            continue
+        target_id = str(run.get("route_thread_id") or "")
+        current = automation_runtimes.get(target_id)
+        if current is None or float(runtime.get("started_at") or now) < float(
+            current.get("started_at") or now
+        ):
+            automation_runtimes[target_id] = runtime
+    lines = [f"置顶任务（{len(pinned)}）", project_line]
     for index, thread in enumerate(pinned, 1):
         thread_id = str(thread["id"])
         session = active_sessions.get(thread_id)
-        runtime = latest_thread_runtime(str(thread["rollout_path"]))
+        runtime = automation_runtimes.get(thread_id) or latest_thread_runtime(
+            str(thread["rollout_path"])
+        )
         if session is not None:
             runtime = {
                 "active": True,
@@ -569,7 +781,24 @@ def pending_turn_ids(state: dict[str, Any]) -> set[str]:
 def poll_threads(
     config: dict[str, Any], state: dict[str, Any], logger: logging.Logger
 ) -> int:
-    threads = read_desktop_threads(config)
+    threads = read_monitored_threads(config, state)
+    if not bool(state.get("automation_runs_initialized", False)):
+        for thread in threads:
+            if not (
+                bool(thread.get("is_automation_run"))
+                or bool(thread.get("is_automation_target"))
+            ):
+                continue
+            rollout = normalized_path(str(thread["rollout_path"]))
+            try:
+                size = rollout.stat().st_size
+            except OSError:
+                continue
+            state["offsets"][str(thread["id"])] = {
+                "path": str(rollout),
+                "offset": size,
+            }
+        state["automation_runs_initialized"] = True
     known_pending = pending_turn_ids(state)
     sent = state["sent_turns"]
     added = 0
@@ -582,7 +811,9 @@ def poll_threads(
         saved = state["offsets"].get(thread_id)
         if saved is None:
             offset = 0
-        elif saved.get("path") != str(rollout):
+        elif saved.get("path") != str(rollout) and not bool(
+            thread.get("is_automation_run")
+        ):
             try:
                 offset = rollout.stat().st_size
             except OSError:
@@ -600,8 +831,12 @@ def poll_threads(
 
         if not bool(state.get("push_enabled", True)):
             continue
-        if not bool(thread.get("is_pinned")):
+        if bool(thread.get("is_automation_run")):
+            if not bool(thread.get("is_pinned")):
+                continue
+        elif not thread_push_is_enabled(thread, state):
             continue
+        route_thread_id = str(thread.get("route_thread_id") or thread_id)
         title = str(thread.get("title") or "未命名任务").strip()
         for event in events:
             turn_id = event["turn_id"]
@@ -610,21 +845,34 @@ def poll_threads(
             state["pending"].append(
                 {
                     "turn_id": turn_id,
-                    "thread_id": thread_id,
+                    "thread_id": route_thread_id,
+                    "source_thread_id": thread_id,
                     "title": title,
                     "answer": event["answer"],
                     "next_chunk": 0,
                     "attempts": 0,
                     "next_retry_at": 0,
                     "queued_at": int(time.time()),
+                    "pin_source": (
+                        "pinned_automation"
+                        if bool(thread.get("is_automation_run"))
+                        else (
+                            "pinned_thread"
+                            if bool(thread.get("is_pinned"))
+                            else "pinned_project"
+                        )
+                    ),
                 }
             )
             known_pending.add(turn_id)
             added += 1
             logger.info("Queued completed pinned turn thread=%s turn=%s", thread_id, turn_id)
 
-    # Keep offsets only for active Desktop user threads plus pending thread IDs.
-    pending_threads = {str(item.get("thread_id")) for item in state["pending"]}
+    # Keep offsets for monitored source threads plus pending source threads.
+    pending_threads = {
+        str(item.get("source_thread_id") or item.get("thread_id"))
+        for item in state["pending"]
+    }
     keep = live_thread_ids | pending_threads
     state["offsets"] = {
         thread_id: value
@@ -1135,6 +1383,27 @@ def submit_desktop_reply(
         return False, str(exc)
 
 
+def read_desktop_queued_follow_up_count(
+    config: dict[str, Any], thread_id: str
+) -> int:
+    base_url = str(config.get("codex_desktop_cdp_url") or "")
+    if not base_url:
+        return 0
+    try:
+        client = DesktopCdpClient(
+            base_url,
+            float(config.get("codex_desktop_cdp_timeout_seconds", 30)),
+        )
+        return client.get_queued_follow_up_count(thread_id)
+    except (OSError, RuntimeError, TimeoutError, ValueError, KeyError) as exc:
+        logging.getLogger("codex_pinned_wechat_notifier").warning(
+            "Could not read Codex Desktop queued follow-up count thread=%s: %s",
+            thread_id,
+            exc,
+        )
+        return 0
+
+
 def trim_sent_history(state: dict[str, Any], limit: int) -> None:
     sent = state["sent_turns"]
     if len(sent) <= limit:
@@ -1358,11 +1627,11 @@ def enqueue_quote_reply(
     thread = read_desktop_thread(config, thread_id)
     if (
         thread is None
-        or not bool(thread.get("is_pinned"))
+        or not thread_push_is_enabled(thread, state)
         or bool(thread.get("archived"))
-        or thread.get("thread_source") != "user"
+        or thread.get("thread_source") not in {"user", "automation"}
     ):
-        return 409, "这个 Codex 任务已取消置顶或归档，未继续回复。"
+        return 409, "这个 Codex 任务已不在允许推送的置顶范围内或已经归档，未继续回复。"
 
     return enqueue_thread_reply(
         config,
@@ -1505,6 +1774,13 @@ def enqueue_thread_reply(
         return 200, f"【{title}】直接提交未成功，已优先排队。"
 
     runtime = latest_thread_runtime(str(thread.get("rollout_path") or ""))
+    # Avoid holding the state lock during CDP I/O, then recheck for races below.
+    with state_lock:
+        if request_id in state["handled_message_ids"] or any(
+            item.get("request_id") == request_id for item in state["reply_queue"]
+        ):
+            return 200, "收到"
+    desktop_ahead = read_desktop_queued_follow_up_count(config, thread_id)
     with state_lock:
         if request_id in state["handled_message_ids"] or any(
             item.get("request_id") == request_id for item in state["reply_queue"]
@@ -1525,13 +1801,14 @@ def enqueue_thread_reply(
             }
         )
         save_state(state_path, state)
-        ahead = sum(
+        wechat_ahead = sum(
             1
             for item in state["reply_queue"]
             if str(item.get("thread_id")) == thread_id
             and item.get("status") == "queued"
             and item.get("request_id") != request_id
         )
+        ahead = desktop_ahead + wechat_ahead
     if runtime.get("active") or ahead:
         response = (
             f"收到，已提交【{title}】，排队中（前方{ahead}条）。\n"
@@ -1579,6 +1856,39 @@ def toggle_pinned_push(
     return 200, f"置顶任务回复推送已{'开启' if enabled else '关闭'}"
 
 
+def toggle_pinned_project_push(
+    config: dict[str, Any],
+    state: dict[str, Any],
+    state_path: Path,
+    state_lock: threading.RLock,
+    payload: dict[str, Any],
+) -> tuple[int, str]:
+    message_id = str(payload.get("message_id") or "").strip()
+    user_id = str(payload.get("user_id") or "").strip()
+    request_id = f"project-push-toggle|{user_id}|{message_id}" if message_id else ""
+    with state_lock:
+        remember_wechat_session(state, payload)
+        if request_id and request_id in state["handled_message_ids"]:
+            enabled = bool(state.get("pinned_project_push_enabled", False))
+            return 200, f"置顶文件夹任务回复推送已{'开启' if enabled else '关闭'}"
+        enabled = not bool(state.get("pinned_project_push_enabled", False))
+        state["pinned_project_push_enabled"] = enabled
+        if not enabled:
+            state["pending"] = [
+                item
+                for item in state["pending"]
+                if item.get("pin_source") != "pinned_project"
+            ]
+        if request_id:
+            state["handled_message_ids"][request_id] = int(time.time())
+            state["handled_message_ids"] = trim_timestamp_dict(
+                state["handled_message_ids"],
+                int(config.get("handled_message_history_limit", 2000)),
+            )
+        save_state(state_path, state)
+    return 200, f"置顶文件夹任务回复推送已{'开启' if enabled else '关闭'}"
+
+
 def health_status(config: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     return {
         "ok": True,
@@ -1586,6 +1896,9 @@ def health_status(config: dict[str, Any], state: dict[str, Any]) -> dict[str, An
         "pending_notifications": len(state.get("pending", [])),
         "queued_wechat_replies": len(state.get("reply_queue", [])),
         "push_enabled": bool(state.get("push_enabled", True)),
+        "pinned_project_push_enabled": bool(
+            state.get("pinned_project_push_enabled", False)
+        ),
         "submit_transport": str(config.get("codex_submit_transport") or ""),
     }
 
@@ -1707,7 +2020,13 @@ class QuoteRouterHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         router = self.server
-        if self.path not in {"/route", "/status", "/toggle", "/task"}:
+        if self.path not in {
+            "/route",
+            "/status",
+            "/toggle",
+            "/folder-toggle",
+            "/task",
+        }:
             self._respond(404, {"handled": False, "message": "not found"})
             return
         expected = str(router.router_token)
@@ -1743,6 +2062,14 @@ class QuoteRouterHandler(BaseHTTPRequestHandler):
                 status_code = 200
             elif self.path == "/toggle":
                 status_code, message = toggle_pinned_push(
+                    router.config,
+                    router.state,
+                    router.state_path,
+                    router.state_lock,
+                    payload,
+                )
+            elif self.path == "/folder-toggle":
+                status_code, message = toggle_pinned_project_push(
                     router.config,
                     router.state,
                     router.state_path,
@@ -1937,8 +2264,12 @@ def run_reply_worker(
         reply = str(item["reply"])
 
     thread = read_desktop_thread(config, thread_id)
-    if thread is None or not bool(thread.get("is_pinned")) or bool(thread.get("archived")):
-        ok, detail = False, "target task is no longer pinned and active"
+    if (
+        thread is None
+        or not thread_push_is_enabled(thread, state)
+        or bool(thread.get("archived"))
+    ):
+        ok, detail = False, "target task is no longer in the enabled pinned scope"
     else:
         logger.info("Starting quoted WeChat reply thread=%s request=%s", thread_id, request_id)
         ok, detail = run_codex_reply(
@@ -2118,12 +2449,22 @@ def status(config: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
         "initialized": bool(state.get("initialized")),
         "eligible_desktop_threads": len(threads),
         "pinned_desktop_threads": sum(bool(thread.get("is_pinned")) for thread in threads),
+        "pinned_project_desktop_threads": sum(
+            bool(thread.get("is_project_pinned")) for thread in threads
+        ),
+        "pinned_automation_desktop_threads": sum(
+            bool(thread.get("is_pinned")) and bool(thread.get("is_automation_target"))
+            for thread in threads
+        ),
         "pending_notifications": len(state.get("pending", [])),
         "sent_turns_remembered": len(state.get("sent_turns", {})),
         "quote_routes_remembered": len(state.get("quote_routes", [])),
         "queued_wechat_replies": len(state.get("reply_queue", [])),
         "quote_router_enabled": bool(config.get("router_enabled", True)),
         "pinned_reply_push_enabled": bool(state.get("push_enabled", True)),
+        "pinned_project_reply_push_enabled": bool(
+            state.get("pinned_project_push_enabled", False)
+        ),
     }
 
 
@@ -2180,9 +2521,10 @@ def run(args: argparse.Namespace) -> int:
             logger,
         )
         if not state.get("initialized"):
-            threads = read_desktop_threads(config)
+            threads = read_monitored_threads(config, state)
             with state_lock:
                 baseline_state(state, threads)
+                state["automation_runs_initialized"] = True
                 save_state(state_path, state)
             logger.info("Initial baseline complete threads=%s", len(threads))
             if args.once:

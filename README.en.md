@@ -19,7 +19,10 @@ routing changes from the author's `quote-router` branch.
 
 ## Features
 
-- Pushes only final answers from pinned, unarchived Desktop user tasks.
+- Pushes final answers from individually pinned, unarchived Desktop user tasks.
+- Recognizes individually pinned Codex automations, pushes new scheduled run
+  results, and routes quoted replies to the automation's target task.
+- `/rwfolder` optionally includes every task inside pinned Desktop projects.
 - `/rw` lists pinned tasks in current sidebar order and runtime status.
 - `/rw3 内容` routes to pinned task 3; `/rw3 /y 内容` submits directly.
 - Quoted normal replies queue while a task is active.
@@ -71,6 +74,7 @@ notifier, local router, and Weixin response path are connected.
 /rw3 内容                   Queue or submit content to pinned task 3
 /rw3 /y 内容                Directly submit content to pinned task 3
 /rwpush                    Toggle final-answer push notifications
+/rwfolder                  Toggle replies from tasks in pinned projects
 /hp                        Show the detailed usage guide
 ```
 
@@ -78,7 +82,8 @@ notifier, local router, and Weixin response path are connected.
 
 ### First-time setup
 
-1. Sign in to Codex Desktop and pin the tasks you want to operate from Weixin.
+1. Sign in to Codex Desktop and pin the regular tasks or automations you want
+   to operate from Weixin.
 2. Make sure both `cc-connect` and this notifier are running. Use
    `notifier.py --selftest` to validate configuration and the loopback router.
 3. Send `/rw` in Weixin. The notifier lists pinned tasks in the current Codex
@@ -89,7 +94,8 @@ notifier, local router, and Weixin response path are connected.
 
 ### Check task status
 
-`/rw` shows every currently pinned task. A running task shows its processing
+`/rw` shows every currently pinned task, including individually pinned
+   automations. A running task shows its processing
    time; an idle task shows `空闲`. If no tasks are pinned, the response says so.
    Numbers follow the current pinned order and can change when tasks are
    unpinned or archived.
@@ -133,6 +139,20 @@ Send `/rwpush` to toggle final-answer push notifications. The response is
    either “置顶任务回复推送已开启” or “置顶任务回复推送已关闭”. This toggle
    affects notifications only; it does not stop Codex tasks, clear queues, or
    disable Weixin submissions.
+
+Send `/rwfolder` to independently include or exclude tasks inside pinned Codex
+Desktop projects. It is off by default. When enabled, an unarchived task in a
+pinned project is pushed even if that task is not individually pinned, and the
+notification can still be quoted to continue the exact task. `/rw` numbering
+continues to list only individually pinned tasks so large projects do not fill
+the numbered command list.
+
+Individually pinned automations do not depend on `/rwfolder`; like other
+individually pinned tasks, they follow the `/rwpush` master switch. Existing
+scheduled run history is baselined and is not replayed. Codex may create and
+archive a separate execution task for each scheduled run; its new final answer
+is associated with the pinned automation target so quoting the notification or
+using `/rw<number> content` continues the target task.
 
 When a quoted reply is sent to a final answer, ordinary text queues if the task
 is processing. Prefix new content with `/y` for direct submission. Queue

@@ -6,6 +6,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -185,12 +186,13 @@ codex_quote_router_token = "test-secret-token"
                 thread_source text,
                 source text,
                 model text,
-                reasoning_effort text
+                reasoning_effort text,
+                cwd text
             )
             """
         )
         db.execute(
-            "insert into threads values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "insert into threads values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 "thread-1",
                 "测试任务",
@@ -201,6 +203,7 @@ codex_quote_router_token = "test-secret-token"
                 "vscode",
                 "gpt-5.6-sol",
                 "high",
+                str(root),
             ),
         )
         db.commit()
@@ -508,7 +511,7 @@ codex_quote_router_token = "test-secret-token"
             self.append_completion(run_rollout, "historical-turn", "历史自动答复")
             db = sqlite3.connect(db_path)
             db.execute(
-                "insert into threads values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "insert into threads values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     "automation-run-1",
                     "Automation: 每日总结\nAutomation ID: daily",
@@ -519,10 +522,11 @@ codex_quote_router_token = "test-secret-token"
                     "vscode",
                     "gpt-5.6-sol",
                     "high",
+                    str(root),
                 ),
             )
             db.execute(
-                "insert into threads values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "insert into threads values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     "stale-automation-run",
                     "Automation: 旧任务名称\nAutomation ID: daily",
@@ -533,6 +537,7 @@ codex_quote_router_token = "test-secret-token"
                     "vscode",
                     "gpt-5.6-sol",
                     "high",
+                    str(root),
                 ),
             )
             db.commit()
@@ -653,6 +658,20 @@ codex_quote_router_token = "test-secret-token"
         recovered = "".join(recovered_parts)
         self.assertEqual(recovered, answer)
 
+    def test_queue_acknowledgement_lists_each_item_and_limits_long_text(self):
+        message = notifier.format_queue_acknowledgement(
+            "测试任务",
+            1,
+            [
+                {"id": "one", "text": "第一行\n第二行", "createdAt": 100},
+                {"id": "two", "text": "很长" * 200, "createdAt": 200},
+            ],
+            220,
+        )
+        self.assertIn("\n\u200b\n当前队列：\n1.第一行 第二行\n2.", message)
+        self.assertTrue(message.endswith("…"))
+        self.assertLessEqual(len(message), 220)
+
     def test_single_notification_uses_requested_format(self):
         chunks = notifier.split_answer("科研", "这是最终答复……", 3400)
         self.assertEqual(
@@ -694,10 +713,17 @@ codex_quote_router_token = "test-secret-token"
             state["reply_queue"].append(
                 {"thread_id": "thread-1", "status": "queued", "reply": "继续"}
             )
+            state["reply_queue"].append(
+                {
+                    "thread_id": "thread-1",
+                    "status": "desktop_queued",
+                    "reply": "原生排队",
+                }
+            )
             with mock.patch.object(notifier.time, "time", return_value=1776254465):
                 message = notifier.format_pinned_task_status(config, state)
             self.assertIn("【测试任务】运行中｜已处理", message)
-            self.assertIn("排队 1", message)
+            self.assertIn("排队 2", message)
             self.assertIn("置顶文件夹推送：已关闭", message)
 
     def test_quote_route_matches_without_storing_answer(self):
@@ -1090,7 +1116,9 @@ codex_quote_router_token = "test-secret-token"
             self.assertEqual(
                 response,
                 '收到，已提交【测试任务】，排队中（前方0条）。\n'
-                '引用这条提示回复"/y"直接提交本条消息。',
+                '引用这条提示回复"/y"直接提交本条消息。\n\u200b\n'
+                '当前队列：\n'
+                '1.继续排队',
             )
             self.assertEqual(len(state["queue_ack_routes"]), 1)
             self.assertEqual(state["reply_queue"][0]["mode"], "queue")
@@ -1292,7 +1320,9 @@ codex_quote_router_token = "test-secret-token"
 
             def desktop_count_before_enqueue(_config, thread_id):
                 self.assertEqual(thread_id, "thread-1")
-                self.assertEqual(state["reply_queue"], [])
+                self.assertEqual(
+                    state["reply_queue"][0]["status"], "native_queuing"
+                )
                 return 1
 
             with mock.patch.object(
@@ -1316,6 +1346,267 @@ codex_quote_router_token = "test-secret-token"
             self.assertEqual(status, 200)
             self.assertIn("排队中（前方1条）", response)
             desktop_count.assert_called_once_with(config, "thread-1")
+
+    def test_default_reply_uses_codex_desktop_native_queue(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rollout, _, config = self.make_fixture(root)
+            self.append_started(rollout, "active-turn")
+            config["codex_desktop_cdp_url"] = "http://127.0.0.1:9335"
+            state_path = root / "state.json"
+            state = notifier.empty_state()
+            message = "【科研】\n答复\n\n↩ 引用此条信息进行回复"
+            notifier.remember_quote_route(
+                state,
+                {"thread_id": "thread-1", "turn_id": "turn-1", "title": "科研"},
+                message,
+                20,
+            )
+            with mock.patch.object(
+                notifier,
+                "enqueue_desktop_queued_follow_up",
+                return_value=(
+                    True,
+                    2,
+                    "native-message-1",
+                    [
+                        {"id": "older", "text": "电脑端已有消息", "createdAt": 100},
+                        {
+                            "id": "native-message-1",
+                            "text": "进入 Codex 原生队列",
+                            "createdAt": 200,
+                        },
+                    ],
+                ),
+            ) as enqueue, mock.patch.object(
+                notifier, "read_desktop_queued_follow_up_count"
+            ) as count:
+                status, response = notifier.enqueue_quote_reply(
+                    config,
+                    state,
+                    state_path,
+                    threading.RLock(),
+                    {
+                        "quote_text": message,
+                        "reply_text": "进入 Codex 原生队列",
+                        "message_id": "native-1",
+                        "user_id": "u1",
+                    },
+                )
+            self.assertEqual(status, 200)
+            self.assertIn("排队中（前方1条）", response)
+            self.assertIn("\n\u200b\n当前队列：\n1.电脑端已有消息\n2.进入 Codex 原生队列", response)
+            self.assertEqual(state["reply_queue"][0]["status"], "desktop_queued")
+            self.assertEqual(
+                state["reply_queue"][0]["native_message_id"], "native-message-1"
+            )
+            enqueue.assert_called_once()
+            count.assert_not_called()
+
+    def test_native_queue_failure_falls_back_to_notifier_queue(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rollout, _, config = self.make_fixture(root)
+            self.append_started(rollout, "active-turn")
+            config["codex_desktop_cdp_url"] = "http://127.0.0.1:9335"
+            state_path = root / "state.json"
+            state = notifier.empty_state()
+            message = "【科研】\n答复\n\n↩ 引用此条信息进行回复"
+            notifier.remember_quote_route(
+                state,
+                {"thread_id": "thread-1", "turn_id": "turn-1", "title": "科研"},
+                message,
+                20,
+            )
+            with mock.patch.object(
+                notifier,
+                "enqueue_desktop_queued_follow_up",
+                return_value=(False, 0, "desktop unavailable", []),
+            ), mock.patch.object(
+                notifier, "read_desktop_queued_follow_ups", return_value=None
+            ), mock.patch.object(
+                notifier, "read_desktop_queued_follow_up_count", return_value=1
+            ):
+                status, response = notifier.enqueue_quote_reply(
+                    config,
+                    state,
+                    state_path,
+                    threading.RLock(),
+                    {
+                        "quote_text": message,
+                        "reply_text": "回退到通知器队列",
+                        "message_id": "native-fallback",
+                        "user_id": "u1",
+                    },
+                )
+            self.assertEqual(status, 200)
+            self.assertIn("前方1条", response)
+            self.assertIn("\n\u200b\n当前队列：\n1.回退到通知器队列", response)
+            self.assertEqual(state["reply_queue"][0]["status"], "queued")
+
+    def test_reconcile_desktop_queue_keeps_present_items_and_handles_removed_items(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, config = self.make_fixture(root)
+            config["codex_desktop_cdp_url"] = "http://127.0.0.1:9335"
+            state_path = root / "state.json"
+            state = notifier.empty_state()
+            state["reply_queue"] = [
+                {
+                    "request_id": "present",
+                    "thread_id": "thread-1",
+                    "native_message_id": "native-present",
+                    "reply": "保留",
+                    "status": "desktop_queued",
+                    "queued_at": int(time.time()),
+                },
+                {
+                    "request_id": "removed",
+                    "thread_id": "thread-1",
+                    "native_message_id": "native-removed",
+                    "reply": "已被桌面处理",
+                    "status": "desktop_queued",
+                    "queued_at": int(time.time()),
+                },
+            ]
+            with mock.patch.object(
+                notifier,
+                "read_desktop_queued_follow_up_ids",
+                return_value={"native-present"},
+            ):
+                submitted, recovered = notifier.reconcile_desktop_queued_replies(
+                    config,
+                    state,
+                    state_path,
+                    threading.RLock(),
+                    notifier.logging.getLogger("test-reconcile"),
+                )
+            self.assertEqual((submitted, recovered), (1, 0))
+            self.assertEqual(
+                [item["request_id"] for item in state["reply_queue"]], ["present"]
+            )
+            self.assertIn("removed", state["handled_message_ids"])
+
+    def test_reconcile_unconfirmed_native_item_falls_back_to_notifier_queue(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, config = self.make_fixture(root)
+            config["codex_desktop_cdp_url"] = "http://127.0.0.1:9335"
+            state_path = root / "state.json"
+            state = notifier.empty_state()
+            state["reply_queue"] = [
+                {
+                    "request_id": "unconfirmed",
+                    "thread_id": "thread-1",
+                    "native_message_id": "native-unconfirmed",
+                    "reply": "等待确认",
+                    "status": "native_queuing",
+                    "queued_at": int(time.time()) - 120,
+                }
+            ]
+            with mock.patch.object(
+                notifier,
+                "read_desktop_queued_follow_up_ids",
+                return_value=set(),
+            ), mock.patch.object(
+                notifier, "read_desktop_thread", return_value=None
+            ):
+                submitted, recovered = notifier.reconcile_desktop_queued_replies(
+                    config,
+                    state,
+                    state_path,
+                    threading.RLock(),
+                    notifier.logging.getLogger("test-reconcile-unconfirmed"),
+                )
+            self.assertEqual((submitted, recovered), (0, 1))
+            self.assertEqual(state["reply_queue"][0]["status"], "queued")
+
+    def test_reconcile_does_not_race_native_enqueue_in_progress(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, config = self.make_fixture(root)
+            config["codex_desktop_cdp_url"] = "http://127.0.0.1:9335"
+            state_path = root / "state.json"
+            state = notifier.empty_state()
+            state["reply_queue"] = [
+                {
+                    "request_id": "in-flight",
+                    "thread_id": "thread-1",
+                    "native_message_id": "native-in-flight",
+                    "reply": "正在写入",
+                    "status": "native_queuing",
+                    "queued_at": int(time.time()),
+                }
+            ]
+            with mock.patch.object(
+                notifier,
+                "read_desktop_queued_follow_up_ids",
+                return_value=set(),
+            ):
+                submitted, recovered = notifier.reconcile_desktop_queued_replies(
+                    config,
+                    state,
+                    state_path,
+                    threading.RLock(),
+                    notifier.logging.getLogger("test-reconcile-in-flight"),
+                )
+            self.assertEqual((submitted, recovered), (0, 0))
+            self.assertEqual(state["reply_queue"][0]["status"], "native_queuing")
+
+    def test_promote_native_queue_removes_item_before_direct_submit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, config = self.make_fixture(root)
+            state_path = root / "state.json"
+            state = notifier.empty_state()
+            response = (
+                "收到，已提交【测试任务】，排队中（前方0条）。\n"
+                '引用这条提示回复"/y"直接提交本条消息。'
+            )
+            notifier.remember_queue_ack_route(
+                state, "queued-native", "测试任务", response, 20
+            )
+            state["reply_queue"] = [
+                {
+                    "request_id": "queued-native",
+                    "thread_id": "thread-1",
+                    "title": "测试任务",
+                    "reply": "直接提交本条",
+                    "mode": "queue",
+                    "status": "desktop_queued",
+                    "native_message_id": "native-message",
+                    "queued_at": int(time.time()),
+                    "queued_at_ms": int(time.time() * 1000),
+                }
+            ]
+            calls = []
+
+            def remove(*_args):
+                calls.append("remove")
+                return True, True, "desktop-cdp"
+
+            def submit(*_args):
+                calls.append("submit")
+                return True, "desktop-cdp"
+
+            with mock.patch.object(
+                notifier, "remove_desktop_queued_follow_up", side_effect=remove
+            ), mock.patch.object(
+                notifier, "submit_desktop_reply", side_effect=submit
+            ):
+                status, message = notifier.promote_queued_reply(
+                    config,
+                    state,
+                    state_path,
+                    threading.RLock(),
+                    response,
+                    "wechat-promote",
+                    state["queue_ack_routes"][0]["sent_at_ms"],
+                )
+            self.assertEqual(status, 200)
+            self.assertEqual(message, "收到，已直接提交给【测试任务】。")
+            self.assertEqual(calls, ["remove", "submit"])
+            self.assertEqual(state["reply_queue"], [])
 
     def test_queue_count_combines_desktop_and_wechat_follow_ups(self):
         with tempfile.TemporaryDirectory() as temp:

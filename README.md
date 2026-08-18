@@ -10,10 +10,10 @@
 Codex 任务的最终答复推送到既有微信会话，并把微信的引用回复路由回原任务。
 
 本仓库不包含任何令牌、数据库、任务记录、微信会话或 cc-connect 上游源码。
-cc-connect 的定制 Go 改动维护在作者 fork 的 `quote-router` 分支，基于上游
-`v1.4.1`。
+面向普通用户的 GitHub Release 已包含经过校验的定制 `cc-connect.exe`；其 Go
+源码仍维护在作者 fork 的 `quote-router` 分支，并在每个发行包中记录固定提交。
 
-> 当前稳定版本：通知器 `1.1.0`，配套 cc-connect 路由补丁 `v1.4.1+qr3`。
+> 当前稳定版本：通知器 `1.2.0`，配套 cc-connect 路由补丁 `v1.4.1+qr15`。
 
 ## 功能
 
@@ -23,6 +23,8 @@ cc-connect 的定制 Go 改动维护在作者 fork 的 `quote-router` 分支，�
 - `/rw` 显示当前置顶顺序、运行时长和排队数。
 - `/rw3 内容` 投递到当前第 3 个置顶任务；`/rw3 /y 内容` 直接提交。
 - 引用最终答复时，任务运行中默认排队；引用排队提示回复 `/y` 可直接提交原消息。
+- 普通排队消息会写入 Codex Desktop 原生排队列表，显示在输入框上方；可在
+  Desktop 中编辑、排序或删除，通知器队列只在原生通道不可用时回退使用。
 - `/rwpush` 开关最终答复推送；引用语音使用微信识别出的文本。
 - `/hp` 在微信内显示面向新手的完整操作指南。
 - 持久化队列、退避重试、去重、仅回环 HTTP 路由和健康检查。
@@ -32,30 +34,50 @@ cc-connect 的定制 Go 改动维护在作者 fork 的 `quote-router` 分支，�
 - Windows 10 或 Windows 11。
 - Python 3.11 或更高版本；通知器运行时只使用 Python 标准库。
 - 已登录的 Codex Desktop，且本机任务数据库和 CDP 调试端点可用。
-- 已配置微信平台的 `cc-connect`，并使用配套 `quote-router` 构建。
+- 首次安装时可扫码登录微信；不需要另外下载或构建 cc-connect。
 - PowerShell 7 推荐用于安装、构建和诊断脚本。
 
 ## 快速开始
 
-1. 将 `config.example.json` 复制为 `config.json`，填写全部占位符。
-2. 生成长度至少 32 字节的随机 `router_token`，同时配置到 cc-connect 微信平台的
-   `codex_quote_router_token`。
-3. 将 cc-connect 的 `codex_quote_router_url` 设置为
-   `http://127.0.0.1:18765/route`，并确认两处令牌完全一致。
-4. 先自检：
+普通用户只需要访问本仓库，不需要打开 cc-connect Fork：
+
+1. 在本仓库的 [Releases](https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/releases/latest)
+   下载 `windows-x64.zip` 和同名 `.sha256` 文件。
+2. 校验 ZIP 后解压：
 
    ```powershell
-   python .\notifier.py --config .\config.json --selftest
+   $zip = Get-Item .\cc-connect-codex-wechat-router-*-windows-x64.zip
+   $expected = ((Get-Content "$($zip.FullName).sha256") -split '\s+')[0]
+   (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower() -eq $expected
+   Expand-Archive $zip.FullName -DestinationPath .\cc-connect-router
+   Set-Location .\cc-connect-router
    ```
 
-5. 注册登录后启动的计划任务：
+   校验结果必须为 `True`。
+
+3. 进入解压后的目录并运行引导安装器：
 
    ```powershell
-   pwsh -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 `
-     -ConfigPath (Join-Path $PWD 'config.json')
+   pwsh -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1
    ```
 
-首次运行只建立偏移基线，不补发历史消息。
+安装器会自动完成以下操作：
+
+- 校验并安装发行包内固定版本的 `cc-connect.exe`；
+- 首次使用时显示微信二维码，扫码完成机器人登录；
+- 自动发现 Codex、Python 和本地任务数据库；
+- 为 cc-connect 和通知器写入同一个随机路由令牌；
+- 修改配置前建立时间戳备份；
+- 注册并启动 `cc-connect` 与 `Codex Pinned WeChat Notifier` 计划任务。
+
+如果 cc-connect 配置里有多个微信项目，使用项目名重新运行：
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1 -CcProject '项目名'
+```
+
+首次运行只建立偏移基线，不补发历史消息。高级用户仍可使用
+`config.example.json`、`install.ps1` 和文末的源码构建命令进行手动安装。
 
 安装完成后，在微信发送 `/rw`。能看到置顶任务列表即表示状态路由、微信回复和通知器均已连通。
 
@@ -86,6 +108,10 @@ cc-connect 的定制 Go 改动维护在作者 fork 的 `quote-router` 分支，�
 ### 回复 Codex 最终答复
 
 收到形如“【聊天名称】”的最终答复通知后，直接引用整条通知并发送文字即可。任务空闲时会立即提交；任务正在处理时，消息默认进入队列，微信会返回前方排队数量。
+
+默认排队时，消息会直接出现在对应 Codex Desktop 任务输入框上方的原生排队列表中，之后由 Desktop 自己按顺序提交。你可以在 Desktop 中修改、调整顺序或删除这条消息；微信端仍会保留一条跟踪记录，用于识别“引用排队提示回复 `/y`”的操作。若 Desktop 原生队列暂时不可用，通知器会自动使用自己的持久化回退队列。
+
+排队确认会在“当前队列”下面按执行顺序列出该任务每条排队消息的内容，包括本次刚提交的消息。多行内容会折叠为一行；内容过长或队列过多时会截断显示，但不修改 Codex Desktop 中保存的原消息。
 
 如果需要跳过队列，在消息前加 `/y`，例如 `/y 请优先检查这个错误`。直接提交失败时，系统会自动退回队列，不会丢失消息。
 
@@ -153,6 +179,10 @@ Get-ScheduledTask -TaskName 'cc-connect','Codex Pinned WeChat Notifier' |
 ```text
 收到，已提交【聊天名称】，排队中（前方x条）。
 引用这条提示回复"/y"直接提交本条消息。
+
+当前队列：
+1.第一条排队消息
+2.第二条排队消息
 ```
 
 ## 开发与发布
@@ -161,6 +191,9 @@ Get-ScheduledTask -TaskName 'cc-connect','Codex Pinned WeChat Notifier' |
 python -m unittest discover -s tests -v
 pwsh -NoProfile -File .\tools\check-public-repo.ps1
 ```
+
+创建 `v*` 标签后，Release 工作流会从固定的 cc-connect Fork 提交构建 Windows
+二进制、运行两边测试、生成组合 ZIP 与 SHA-256，并发布到本仓库 Releases。
 
 `config.json`、`data/`、`logs/`、构建产物和旧本机部署脚本已由 `.gitignore`
 排除。公开发布前仍应检查 `git status --ignored`，不要提交真实令牌或路径。

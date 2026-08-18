@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import tomllib
+import uuid
 from typing import Any
 from datetime import datetime, timezone
 
@@ -27,7 +28,7 @@ from websocket_transport import SharedAppServerProcess, WebSocketConnection
 
 
 STATE_VERSION = 2
-NOTIFIER_VERSION = "1.1.0"
+NOTIFIER_VERSION = "1.2.0"
 QUOTE_FOOTER = "↩ 引用此条信息进行回复"
 QUEUE_HINT = "如任务正在处理，则默认排队，直接提交请加前缀“/y”"
 WECHAT_BLANK_LINE = "\u200b"
@@ -332,7 +333,7 @@ def read_desktop_threads(config: dict[str, Any]) -> list[dict[str, Any]]:
         return []
     placeholders = ",".join("?" for _ in sources)
     sql = f"""
-        SELECT id, title, rollout_path, is_pinned, model, reasoning_effort
+        SELECT id, title, rollout_path, is_pinned, model, reasoning_effort, cwd
         FROM threads
         WHERE archived = 0
           AND rollout_path IS NOT NULL
@@ -391,7 +392,7 @@ def read_automation_runs(config: dict[str, Any]) -> list[dict[str, Any]]:
     placeholders = ",".join("?" for _ in sources)
     sql = f"""
         SELECT id, title, rollout_path, archived, source, thread_source,
-               model, reasoning_effort
+               model, reasoning_effort, cwd
         FROM threads
         WHERE rollout_path IS NOT NULL
           AND thread_source = 'automation'
@@ -453,7 +454,7 @@ def read_desktop_thread(config: dict[str, Any], thread_id: str) -> dict[str, Any
     placeholders = ",".join("?" for _ in sources)
     sql = f"""
         SELECT id, title, rollout_path, is_pinned, archived, source, thread_source,
-               model, reasoning_effort
+               model, reasoning_effort, cwd
         FROM threads
         WHERE id = ?
           AND source IN ({placeholders})
@@ -522,6 +523,10 @@ def recover_interrupted_reply_requests(
     requeued = 0
     for item in list(state.get("reply_queue", [])):
         if item.get("status") not in {"running", "promoting", "dispatching"}:
+            continue
+        if item.get("status") == "promoting" and item.get("native_message_id"):
+            item["status"] = "native_queuing"
+            requeued += 1
             continue
         request_id = str(item.get("request_id") or "")
         thread_id = str(item.get("thread_id") or "")
@@ -716,7 +721,8 @@ def format_pinned_task_status(
         queued = sum(
             1
             for item in state.get("reply_queue", [])
-            if str(item.get("thread_id")) == thread_id and item.get("status") == "queued"
+            if str(item.get("thread_id")) == thread_id
+            and item.get("status") in {"queued", "desktop_queued", "native_queuing"}
         )
         if queued:
             status_text += f"｜排队 {queued}"
@@ -1404,6 +1410,161 @@ def read_desktop_queued_follow_up_count(
         return 0
 
 
+def read_desktop_queued_follow_up_ids(
+    config: dict[str, Any], thread_id: str
+) -> set[str] | None:
+    base_url = str(config.get("codex_desktop_cdp_url") or "")
+    if not base_url:
+        return None
+    try:
+        client = DesktopCdpClient(
+            base_url,
+            float(config.get("codex_desktop_cdp_timeout_seconds", 30)),
+        )
+        return set(client.get_queued_follow_up_ids(thread_id))
+    except (OSError, RuntimeError, TimeoutError, ValueError, KeyError) as exc:
+        logging.getLogger("codex_pinned_wechat_notifier").warning(
+            "Could not read Codex Desktop queued follow-up IDs thread=%s: %s",
+            thread_id,
+            exc,
+        )
+        return None
+
+
+def read_desktop_queued_follow_ups(
+    config: dict[str, Any], thread_id: str
+) -> list[dict[str, Any]] | None:
+    base_url = str(config.get("codex_desktop_cdp_url") or "")
+    if not base_url:
+        return None
+    try:
+        client = DesktopCdpClient(
+            base_url,
+            float(config.get("codex_desktop_cdp_timeout_seconds", 30)),
+        )
+        return client.get_queued_follow_ups(thread_id)
+    except (OSError, RuntimeError, TimeoutError, ValueError, KeyError) as exc:
+        logging.getLogger("codex_pinned_wechat_notifier").warning(
+            "Could not read Codex Desktop queued follow-ups thread=%s: %s",
+            thread_id,
+            exc,
+        )
+        return None
+
+
+def enqueue_desktop_queued_follow_up(
+    config: dict[str, Any],
+    thread: dict[str, Any],
+    reply: str,
+    native_message_id: str,
+    created_at_ms: int,
+) -> tuple[bool, int, str, list[dict[str, Any]]]:
+    base_url = str(config.get("codex_desktop_cdp_url") or "")
+    cwd = str(thread.get("cwd") or "")
+    if not base_url:
+        return False, 0, "Codex Desktop queued follow-up transport is unavailable", []
+    if not cwd:
+        return False, 0, "target Codex Desktop task has no working directory", []
+    try:
+        client = DesktopCdpClient(
+            base_url,
+            float(config.get("codex_desktop_cdp_timeout_seconds", 30)),
+        )
+        result = client.enqueue_queued_follow_up(
+            str(thread["id"]),
+            reply,
+            str(normalized_path(cwd)),
+            native_message_id,
+            created_at_ms,
+        )
+        count = result.get("queuedCount")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+            raise RuntimeError("Codex Desktop returned an invalid queued count")
+        queued_items = result.get("queuedItems")
+        if not isinstance(queued_items, list) or not all(
+            isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+            and isinstance(item.get("text"), str)
+            and isinstance(item.get("createdAt"), (int, float))
+            and not isinstance(item.get("createdAt"), bool)
+            for item in queued_items
+        ):
+            raise RuntimeError("Codex Desktop returned invalid queued follow-ups")
+        return (
+            True,
+            count,
+            str(result.get("queuedMessageId") or native_message_id),
+            [
+                {
+                    "id": str(item["id"]),
+                    "text": str(item["text"]),
+                    "createdAt": int(item["createdAt"]),
+                }
+                for item in queued_items
+            ],
+        )
+    except (OSError, RuntimeError, TimeoutError, ValueError, KeyError) as exc:
+        return False, 0, str(exc), []
+
+
+def remove_desktop_queued_follow_up(
+    config: dict[str, Any], thread_id: str, native_message_id: str
+) -> tuple[bool, bool, str]:
+    base_url = str(config.get("codex_desktop_cdp_url") or "")
+    if not base_url:
+        return False, False, "Codex Desktop queued follow-up transport is unavailable"
+    try:
+        client = DesktopCdpClient(
+            base_url,
+            float(config.get("codex_desktop_cdp_timeout_seconds", 30)),
+        )
+        result = client.remove_queued_follow_up(thread_id, native_message_id)
+        removed = result.get("removed")
+        if not isinstance(removed, bool):
+            raise RuntimeError("Codex Desktop returned an invalid removal result")
+        return True, removed, "desktop-cdp"
+    except (OSError, RuntimeError, TimeoutError, ValueError, KeyError) as exc:
+        return False, False, str(exc)
+
+
+def format_queue_acknowledgement(
+    title: str,
+    ahead: int,
+    queue_items: list[dict[str, Any]],
+    max_chars: int,
+) -> str:
+    header = (
+        f"收到，已提交【{title}】，排队中（前方{ahead}条）。\n"
+        f'引用这条提示回复"/y"直接提交本条消息。\n{WECHAT_BLANK_LINE}\n'
+        "当前队列："
+    )
+    if not queue_items:
+        return header + "\n（暂时无法读取队列内容）"
+
+    indexed = list(enumerate(queue_items))
+    indexed.sort(
+        key=lambda pair: (
+            int(pair[1].get("createdAt") or 0) <= 0,
+            int(pair[1].get("createdAt") or 0) or pair[0],
+            pair[0],
+        )
+    )
+    visible = indexed[:20]
+    hidden_count = max(0, len(indexed) - len(visible))
+    suffix = f"\n（另有{hidden_count}条未显示）" if hidden_count else ""
+    available = max(0, max_chars - len(header) - len(suffix) - len(visible))
+    per_item_limit = max(16, min(300, available // max(1, len(visible)) - 8))
+    lines: list[str] = []
+    for display_index, (_, item) in enumerate(visible, 1):
+        text = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
+        if not text:
+            text = "（空消息）"
+        if len(text) > per_item_limit:
+            text = text[: max(1, per_item_limit - 1)].rstrip() + "…"
+        lines.append(f"{display_index}.{text}")
+    return header + "\n" + "\n".join(lines) + suffix
+
+
 def trim_sent_history(state: dict[str, Any], limit: int) -> None:
     sent = state["sent_turns"]
     if len(sent) <= limit:
@@ -1496,12 +1657,69 @@ def promote_queued_reply(
         title = clean_chat_title(str(item.get("title") or route.get("title") or "未命名任务"))
         if item.get("status") in {"running", "promoting"}:
             return 200, f"【{title}】这条消息已在提交中。"
+        native_queued = item.get("status") in {
+            "desktop_queued",
+            "native_queuing",
+        }
         item["status"] = "promoting"
         save_state(state_path, state)
         thread_id = str(item.get("thread_id") or "")
         reply = str(item.get("reply") or "")
+        native_message_id = str(item.get("native_message_id") or "")
+        created_at_ms = int(item.get("queued_at_ms") or 0)
+
+    if native_queued:
+        remove_ok, removed, remove_detail = remove_desktop_queued_follow_up(
+            config, thread_id, native_message_id
+        )
+        if not remove_ok:
+            with state_lock:
+                item = next(
+                    (
+                        entry
+                        for entry in state["reply_queue"]
+                        if entry.get("request_id") == queued_request_id
+                    ),
+                    None,
+                )
+                if item is not None:
+                    item["status"] = "desktop_queued"
+                save_state(state_path, state)
+            return 200, f"【{title}】暂时无法从 Codex 排队队列取出：{remove_detail[-200:]}"
+        if not removed:
+            with state_lock:
+                item = next(
+                    (
+                        entry
+                        for entry in state["reply_queue"]
+                        if entry.get("request_id") == queued_request_id
+                    ),
+                    None,
+                )
+                if item is not None:
+                    state["reply_queue"].remove(item)
+                state["handled_message_ids"][queued_request_id] = int(time.time())
+                state["handled_message_ids"][request_id] = int(time.time())
+                state["handled_message_ids"] = trim_timestamp_dict(
+                    state["handled_message_ids"],
+                    int(config.get("handled_message_history_limit", 2000)),
+                )
+                save_state(state_path, state)
+            return 200, "这条排队消息已提交、处理完成或已从 Codex 队列删除。"
 
     ok, _ = submit_desktop_reply(config, thread_id, reply)
+    native_requeued = False
+    native_detail = ""
+    if not ok and native_queued:
+        thread = read_desktop_thread(config, thread_id)
+        if thread is not None:
+            native_requeued, _, native_detail, _ = enqueue_desktop_queued_follow_up(
+                config,
+                thread,
+                reply,
+                native_message_id,
+                created_at_ms or int(time.time() * 1000),
+            )
     with state_lock:
         item = next(
             (
@@ -1523,10 +1741,14 @@ def promote_queued_reply(
             save_state(state_path, state)
             return 200, f"收到，已直接提交给【{title}】。"
         if item is not None:
-            item["status"] = "queued"
-            item["mode"] = "direct"
+            item["status"] = "desktop_queued" if native_requeued else "queued"
+            item["mode"] = "queue" if native_requeued else "direct"
             item["next_retry_at"] = 0
+            if native_detail and not native_requeued:
+                item["native_queue_error"] = native_detail[-500:]
         save_state(state_path, state)
+    if native_requeued:
+        return 200, f"【{title}】直接提交未成功，已重新加入 Codex 排队队列。"
     return 200, f"【{title}】直接提交未成功，已优先排队。"
 
 
@@ -1774,32 +1996,64 @@ def enqueue_thread_reply(
         return 200, f"【{title}】直接提交未成功，已优先排队。"
 
     runtime = latest_thread_runtime(str(thread.get("rollout_path") or ""))
-    # Avoid holding the state lock during CDP I/O, then recheck for races below.
+    queued_at = int(time.time())
+    queued_at_ms = int(time.time() * 1000)
+    native_message_id = str(
+        uuid.uuid5(uuid.NAMESPACE_URL, f"cc-connect-wechat:{request_id}")
+    )
     with state_lock:
         if request_id in state["handled_message_ids"] or any(
             item.get("request_id") == request_id for item in state["reply_queue"]
         ):
             return 200, "收到"
-    desktop_ahead = read_desktop_queued_follow_up_count(config, thread_id)
-    with state_lock:
-        if request_id in state["handled_message_ids"] or any(
-            item.get("request_id") == request_id for item in state["reply_queue"]
-        ):
-            return 200, "收到"
-        state["reply_queue"].append(
-            {
-                "request_id": request_id,
-                "message_id": message_id,
-                "thread_id": thread_id,
-                "title": title,
-                "reply": reply_text,
-                "mode": mode,
-                "status": "queued",
-                "attempts": 0,
-                "next_retry_at": 0,
-                "queued_at": int(time.time()),
-            }
+        item = {
+            "request_id": request_id,
+            "message_id": message_id,
+            "thread_id": thread_id,
+            "title": title,
+            "reply": reply_text,
+            "mode": mode,
+            "status": "native_queuing",
+            "native_message_id": native_message_id,
+            "attempts": 0,
+            "next_retry_at": 0,
+            "queued_at": queued_at,
+            "queued_at_ms": queued_at_ms,
+        }
+        state["reply_queue"].append(item)
+        save_state(state_path, state)
+
+    native_ok, native_count, native_detail, native_queue_items = (
+        enqueue_desktop_queued_follow_up(
+            config, thread, reply_text, native_message_id, queued_at_ms
         )
+    )
+    desktop_ahead = 0
+    if not native_ok:
+        desktop_queue_items = read_desktop_queued_follow_ups(config, thread_id)
+        if desktop_queue_items is None:
+            desktop_ahead = read_desktop_queued_follow_up_count(config, thread_id)
+        else:
+            native_queue_items = desktop_queue_items
+            desktop_ahead = len(desktop_queue_items)
+
+    with state_lock:
+        item = next(
+            (
+                entry
+                for entry in state["reply_queue"]
+                if entry.get("request_id") == request_id
+            ),
+            None,
+        )
+        if item is None:
+            return 200, "收到"
+        if native_ok:
+            item["status"] = "desktop_queued"
+            item["native_message_id"] = native_detail
+        else:
+            item["status"] = "queued"
+            item["native_queue_error"] = native_detail[-500:]
         save_state(state_path, state)
         wechat_ahead = sum(
             1
@@ -1808,11 +2062,39 @@ def enqueue_thread_reply(
             and item.get("status") == "queued"
             and item.get("request_id") != request_id
         )
-        ahead = desktop_ahead + wechat_ahead
+        ahead = (
+            max(0, native_count - 1) + wechat_ahead
+            if native_ok
+            else desktop_ahead + wechat_ahead
+        )
+        fallback_queue_items = [
+            {
+                "id": str(entry.get("native_message_id") or entry.get("request_id") or ""),
+                "text": str(entry.get("reply") or ""),
+                "createdAt": int(
+                    entry.get("queued_at_ms")
+                    or int(entry.get("queued_at") or 0) * 1000
+                ),
+            }
+            for entry in state["reply_queue"]
+            if str(entry.get("thread_id")) == thread_id
+            and entry.get("status") == "queued"
+        ]
     if runtime.get("active") or ahead:
-        response = (
-            f"收到，已提交【{title}】，排队中（前方{ahead}条）。\n"
-            '引用这条提示回复"/y"直接提交本条消息。'
+        known_ids = {
+            str(item.get("id") or "") for item in native_queue_items if item.get("id")
+        }
+        queue_items = [*native_queue_items]
+        queue_items.extend(
+            item
+            for item in fallback_queue_items
+            if not item.get("id") or str(item.get("id")) not in known_ids
+        )
+        response = format_queue_acknowledgement(
+            title,
+            ahead,
+            queue_items,
+            int(config.get("max_message_chars", 3400)),
         )
         with state_lock:
             remember_queue_ack_route(
@@ -2242,6 +2524,121 @@ def dispatch_reply_requests(
     return started
 
 
+def reconcile_desktop_queued_replies(
+    config: dict[str, Any],
+    state: dict[str, Any],
+    state_path: Path,
+    state_lock: threading.RLock,
+    logger: logging.Logger,
+) -> tuple[int, int]:
+    with state_lock:
+        tracked = [
+            {
+                "request_id": str(item.get("request_id") or ""),
+                "thread_id": str(item.get("thread_id") or ""),
+                "native_message_id": str(item.get("native_message_id") or ""),
+                "status": str(item.get("status") or ""),
+                "reply": str(item.get("reply") or ""),
+                "queued_at": int(item.get("queued_at") or 0),
+            }
+            for item in state.get("reply_queue", [])
+            if item.get("status") in {"desktop_queued", "native_queuing"}
+            and item.get("native_message_id")
+        ]
+    if not tracked:
+        return 0, 0
+
+    queued_ids_by_thread: dict[str, set[str]] = {}
+    for thread_id in {item["thread_id"] for item in tracked}:
+        queued_ids = read_desktop_queued_follow_up_ids(config, thread_id)
+        if queued_ids is not None:
+            queued_ids_by_thread[thread_id] = queued_ids
+
+    submitted = 0
+    recovered = 0
+    now = int(time.time())
+    native_enqueue_grace = max(
+        5,
+        int(float(config.get("codex_desktop_cdp_timeout_seconds", 30)) * 2),
+    )
+    for snapshot in tracked:
+        thread_id = snapshot["thread_id"]
+        queued_ids = queued_ids_by_thread.get(thread_id)
+        if queued_ids is None:
+            continue
+        native_message_id = snapshot["native_message_id"]
+        if native_message_id in queued_ids:
+            if snapshot["status"] == "native_queuing":
+                with state_lock:
+                    item = next(
+                        (
+                            entry
+                            for entry in state["reply_queue"]
+                            if entry.get("request_id") == snapshot["request_id"]
+                        ),
+                        None,
+                    )
+                    if item is not None and item.get("status") == "native_queuing":
+                        item["status"] = "desktop_queued"
+                        save_state(state_path, state)
+                        recovered += 1
+            continue
+
+        turn_id = ""
+        if snapshot["status"] == "native_queuing":
+            queued_at = snapshot["queued_at"]
+            if queued_at > 0 and now - queued_at < native_enqueue_grace:
+                continue
+            thread = read_desktop_thread(config, thread_id)
+            if thread is not None:
+                turn_id = find_submitted_reply_turn(
+                    str(thread.get("rollout_path") or ""),
+                    snapshot["reply"],
+                    snapshot["queued_at"],
+                )
+
+        with state_lock:
+            item = next(
+                (
+                    entry
+                    for entry in state["reply_queue"]
+                    if entry.get("request_id") == snapshot["request_id"]
+                ),
+                None,
+            )
+            if item is None or item.get("status") not in {
+                "desktop_queued",
+                "native_queuing",
+            }:
+                continue
+            if snapshot["status"] == "native_queuing" and not turn_id:
+                item["status"] = "queued"
+                item["next_retry_at"] = 0
+                recovered += 1
+                logger.warning(
+                    "Recovered unconfirmed native queue item into fallback queue "
+                    "thread=%s request=%s",
+                    thread_id,
+                    snapshot["request_id"],
+                )
+            else:
+                state["reply_queue"].remove(item)
+                state["handled_message_ids"][snapshot["request_id"]] = int(time.time())
+                state["handled_message_ids"] = trim_timestamp_dict(
+                    state["handled_message_ids"],
+                    int(config.get("handled_message_history_limit", 2000)),
+                )
+                submitted += 1
+                logger.info(
+                    "Native Codex queued reply left queue thread=%s request=%s turn=%s",
+                    thread_id,
+                    snapshot["request_id"],
+                    turn_id or "desktop-managed",
+                )
+            save_state(state_path, state)
+    return submitted, recovered
+
+
 def run_reply_worker(
     config: dict[str, Any],
     state: dict[str, Any],
@@ -2542,6 +2939,13 @@ def run(args: argparse.Namespace) -> int:
                     poll_threads(config, state, logger)
                     save_state(state_path, state)
                 deliver_pending(config, state, state_path, state_lock, logger)
+                reconcile_desktop_queued_replies(
+                    config,
+                    state,
+                    state_path,
+                    state_lock,
+                    logger,
+                )
                 dispatch_reply_requests(
                     config,
                     state,

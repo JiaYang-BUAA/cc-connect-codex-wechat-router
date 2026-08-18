@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [ValidateRange(1, 9999)]
-    [int]$PatchVersion = 10,
+    [int]$PatchVersion = 15,
     [string]$BaseVersion = '1.4.1',
     [string]$SourceRoot = (Join-Path (Split-Path -Parent $PSCommandPath) 'artifacts'),
     [string]$Target = '',

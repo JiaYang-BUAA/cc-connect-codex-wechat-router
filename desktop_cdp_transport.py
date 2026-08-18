@@ -59,7 +59,7 @@ DESKTOP_REQUEST_CLIENT_LOOKUP = r"""
 
 
 DESKTOP_QUEUED_FOLLOW_UP_LOOKUP = r"""
-  function findDesktopQueuedFollowUpsQuery() {
+  function findDesktopQueuedFollowUpsContext() {
     const root = window.__codexRoot?._internalRoot?.current;
     if (!root) throw new Error('Codex Desktop React root was not found');
     const queue = [root];
@@ -87,7 +87,7 @@ DESKTOP_QUEUED_FOLLOW_UP_LOOKUP = r"""
                 JSON.stringify(key).includes('queued-follow-ups')
               );
             });
-            if (query) return query;
+            if (query) return { query, queryClient: value };
           }
         }
       } catch {}
@@ -112,6 +112,57 @@ DESKTOP_QUEUED_FOLLOW_UP_LOOKUP = r"""
       }
     }
     throw new Error('Codex Desktop queued follow-up cache was not found');
+  }
+""".strip()
+
+
+DESKTOP_MANAGER_LOOKUP = r"""
+  function findDesktopManager() {
+    const root = window.__codexRoot?._internalRoot?.current;
+    if (!root) throw new Error('Codex Desktop React root was not found');
+    const queue = [root];
+    const seen = new WeakSet();
+    let cursor = 0;
+    let visited = 0;
+    while (cursor < queue.length && visited < 200000) {
+      const value = queue[cursor++];
+      if (
+        value == null ||
+        (typeof value !== 'object' && typeof value !== 'function') ||
+        seen.has(value)
+      ) continue;
+      seen.add(value);
+      visited += 1;
+      try {
+        if (
+          typeof value.fetchFromHost === 'function' &&
+          value.hostId === 'local' &&
+          value.scope &&
+          value.threadStore &&
+          value.requestClient
+        ) return value;
+      } catch {}
+      let descriptors;
+      try {
+        descriptors = Object.getOwnPropertyDescriptors(value);
+      } catch {
+        continue;
+      }
+      for (const descriptor of Object.values(descriptors)) {
+        if (!Object.prototype.hasOwnProperty.call(descriptor, 'value')) continue;
+        const child = descriptor.value;
+        if (
+          child != null &&
+          (typeof child === 'object' || typeof child === 'function')
+        ) queue.push(child);
+      }
+      if (value instanceof Map) {
+        for (const [key, child] of value) queue.push(key, child);
+      } else if (value instanceof Set) {
+        for (const child of value) queue.push(child);
+      }
+    }
+    throw new Error('Codex Desktop local manager was not found');
   }
 """.strip()
 
@@ -205,13 +256,191 @@ def build_queued_follow_up_count_expression(thread_id: str) -> str:
     return f"""
 (() => {{
   {DESKTOP_QUEUED_FOLLOW_UP_LOOKUP}
-  const query = findDesktopQueuedFollowUpsQuery();
+  const {{ query }} = findDesktopQueuedFollowUpsContext();
   const queuedByThread = query?.state?.data?.value;
   const queuedForThread = queuedByThread?.[{encoded_thread_id}];
   return {{
     ok: true,
     queuedCount: Array.isArray(queuedForThread) ? queuedForThread.length : 0,
   }};
+}})()
+""".strip()
+
+
+def build_queued_follow_up_ids_expression(thread_id: str) -> str:
+    encoded_thread_id = json.dumps(thread_id, ensure_ascii=True)
+    return f"""
+(() => {{
+  {DESKTOP_QUEUED_FOLLOW_UP_LOOKUP}
+  const {{ query }} = findDesktopQueuedFollowUpsContext();
+  const queuedByThread = query?.state?.data?.value;
+  const queuedForThread = queuedByThread?.[{encoded_thread_id}];
+  return {{
+    ok: true,
+    queuedIds: Array.isArray(queuedForThread)
+      ? queuedForThread.map((item) => String(item?.id ?? '')).filter(Boolean)
+      : [],
+  }};
+}})()
+""".strip()
+
+
+def build_queued_follow_up_items_expression(thread_id: str) -> str:
+    encoded_thread_id = json.dumps(thread_id, ensure_ascii=True)
+    return f"""
+(() => {{
+  {DESKTOP_QUEUED_FOLLOW_UP_LOOKUP}
+  const {{ query }} = findDesktopQueuedFollowUpsContext();
+  const queuedByThread = query?.state?.data?.value;
+  const queuedForThread = queuedByThread?.[{encoded_thread_id}];
+  return {{
+    ok: true,
+    queuedItems: Array.isArray(queuedForThread)
+      ? queuedForThread.map((item) => ({{
+          id: String(item?.id ?? ''),
+          text: String(item?.text ?? item?.context?.prompt ?? ''),
+          createdAt: Number(item?.createdAt ?? 0),
+        }}))
+      : [],
+  }};
+}})()
+""".strip()
+
+
+def build_enqueue_queued_follow_up_expression(
+    thread_id: str,
+    prompt: str,
+    cwd: str,
+    message_id: str,
+    created_at_ms: int,
+) -> str:
+    payload = json.dumps(
+        {
+            "threadId": thread_id,
+            "message": {
+                "id": message_id,
+                "text": prompt,
+                "context": {
+                    "prompt": prompt,
+                    "addedFiles": [],
+                    "fileAttachments": [],
+                    "pastedTextAttachments": [],
+                    "imageAttachments": [],
+                    "appshotContexts": [],
+                    "commentAttachments": [],
+                    "mcpAppModelContextAttachments": [],
+                    "computerUseAppMentions": [],
+                    "chatGptConversationContexts": [],
+                    "responseTextAnnotations": [],
+                    "selectedTextAttachments": [],
+                    "pullRequestChecks": [],
+                    "pullRequestMergeConflict": None,
+                    "threadReferences": [],
+                    "workspaceRoots": [cwd] if cwd else [],
+                    "collaborationMode": None,
+                },
+                "cwd": cwd,
+                "createdAt": created_at_ms,
+                "mentionedBrowserFamilies": [],
+            },
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return f"""
+(async () => {{
+  {DESKTOP_QUEUED_FOLLOW_UP_LOOKUP}
+  {DESKTOP_MANAGER_LOOKUP}
+  const payload = {payload};
+  const operation = async () => {{
+    const manager = findDesktopManager();
+    const {{ query, queryClient }} = findDesktopQueuedFollowUpsContext();
+    const fetched = await manager.fetchFromHost(
+      'get-global-state',
+      {{ params: {{ key: 'queued-follow-ups' }} }}
+    );
+    const queuedByThread = {{ ...(fetched?.value ?? {{}}) }};
+    const current = Array.isArray(queuedByThread[payload.threadId])
+      ? queuedByThread[payload.threadId]
+      : [];
+    const existing = current.find((item) => item?.id === payload.message.id);
+    const messages = existing ? current : [...current, payload.message];
+    const next = {{ ...queuedByThread, [payload.threadId]: messages }};
+    if (!existing) {{
+      const saved = await manager.fetchFromHost(
+        'set-global-state',
+        {{ params: {{ key: 'queued-follow-ups', value: next }} }}
+      );
+      if (saved?.success !== true) {{
+        throw new Error('Codex Desktop did not persist the queued follow-up');
+      }}
+    }}
+    queryClient.setQueryData(query.queryKey, {{ value: next }});
+    return {{
+      ok: true,
+      inserted: !existing,
+      queuedMessageId: payload.message.id,
+      queuedCount: messages.length,
+      queuedItems: messages.map((item) => ({{
+        id: String(item?.id ?? ''),
+        text: String(item?.text ?? item?.context?.prompt ?? ''),
+        createdAt: Number(item?.createdAt ?? 0),
+      }})),
+    }};
+  }};
+  return globalThis.navigator?.locks
+    ? globalThis.navigator.locks.request('codex-queued-follow-up-state', operation)
+    : operation();
+}})()
+""".strip()
+
+
+def build_remove_queued_follow_up_expression(
+    thread_id: str, message_id: str
+) -> str:
+    payload = json.dumps(
+        {"threadId": thread_id, "messageId": message_id},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return f"""
+(async () => {{
+  {DESKTOP_QUEUED_FOLLOW_UP_LOOKUP}
+  {DESKTOP_MANAGER_LOOKUP}
+  const payload = {payload};
+  const operation = async () => {{
+    const manager = findDesktopManager();
+    const {{ query, queryClient }} = findDesktopQueuedFollowUpsContext();
+    const fetched = await manager.fetchFromHost(
+      'get-global-state',
+      {{ params: {{ key: 'queued-follow-ups' }} }}
+    );
+    const queuedByThread = {{ ...(fetched?.value ?? {{}}) }};
+    const current = Array.isArray(queuedByThread[payload.threadId])
+      ? queuedByThread[payload.threadId]
+      : [];
+    const messages = current.filter((item) => item?.id !== payload.messageId);
+    const removed = messages.length !== current.length;
+    if (!removed) {{
+      queryClient.setQueryData(query.queryKey, {{ value: queuedByThread }});
+      return {{ ok: true, removed: false, queuedCount: current.length }};
+    }}
+    const next = {{ ...queuedByThread }};
+    if (messages.length === 0) delete next[payload.threadId];
+    else next[payload.threadId] = messages;
+    const saved = await manager.fetchFromHost(
+      'set-global-state',
+      {{ params: {{ key: 'queued-follow-ups', value: next }} }}
+    );
+    if (saved?.success !== true) {{
+      throw new Error('Codex Desktop did not persist the queued follow-up removal');
+    }}
+    queryClient.setQueryData(query.queryKey, {{ value: next }});
+    return {{ ok: true, removed: true, queuedCount: messages.length }};
+  }};
+  return globalThis.navigator?.locks
+    ? globalThis.navigator.locks.request('codex-queued-follow-up-state', operation)
+    : operation();
 }})()
 """.strip()
 
@@ -300,6 +529,60 @@ class DesktopCdpClient:
         if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             raise RuntimeError("Codex Desktop returned an invalid queued follow-up count")
         return count
+
+    def get_queued_follow_up_ids(self, thread_id: str) -> list[str]:
+        result = self.evaluate(build_queued_follow_up_ids_expression(thread_id))
+        queued_ids = result.get("queuedIds")
+        if not isinstance(queued_ids, list) or not all(
+            isinstance(item, str) and item for item in queued_ids
+        ):
+            raise RuntimeError("Codex Desktop returned invalid queued follow-up IDs")
+        return queued_ids
+
+    def get_queued_follow_ups(self, thread_id: str) -> list[dict[str, Any]]:
+        result = self.evaluate(build_queued_follow_up_items_expression(thread_id))
+        queued_items = result.get("queuedItems")
+        if not isinstance(queued_items, list):
+            raise RuntimeError("Codex Desktop returned invalid queued follow-ups")
+        normalized: list[dict[str, Any]] = []
+        for item in queued_items:
+            if not isinstance(item, dict):
+                raise RuntimeError("Codex Desktop returned invalid queued follow-ups")
+            item_id = item.get("id")
+            text = item.get("text")
+            created_at = item.get("createdAt")
+            if (
+                not isinstance(item_id, str)
+                or not isinstance(text, str)
+                or not isinstance(created_at, (int, float))
+                or isinstance(created_at, bool)
+            ):
+                raise RuntimeError("Codex Desktop returned invalid queued follow-ups")
+            normalized.append(
+                {"id": item_id, "text": text, "createdAt": int(created_at)}
+            )
+        return normalized
+
+    def enqueue_queued_follow_up(
+        self,
+        thread_id: str,
+        prompt: str,
+        cwd: str,
+        message_id: str,
+        created_at_ms: int,
+    ) -> dict[str, Any]:
+        return self.evaluate(
+            build_enqueue_queued_follow_up_expression(
+                thread_id, prompt, cwd, message_id, created_at_ms
+            )
+        )
+
+    def remove_queued_follow_up(
+        self, thread_id: str, message_id: str
+    ) -> dict[str, Any]:
+        return self.evaluate(
+            build_remove_queued_follow_up_expression(thread_id, message_id)
+        )
 
     def send_follow_up(
         self,

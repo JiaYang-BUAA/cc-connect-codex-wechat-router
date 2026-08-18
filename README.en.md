@@ -11,11 +11,12 @@ answers from currently pinned Codex Desktop tasks to an existing Weixin
 session, then routes quoted replies back to the matching task.
 
 This repository does not contain credentials, Codex databases, transcripts, or
-the upstream cc-connect source. It requires a custom cc-connect build with the
-routing changes from the author's `quote-router` branch.
+the upstream cc-connect source. End-user GitHub Releases include a verified
+custom `cc-connect.exe`; its Go source remains in the author's `quote-router`
+fork branch, and every bundle records the pinned source commit.
 
-> Current stable pair: notifier `1.1.0` and cc-connect routing patch
-> `v1.4.1+qr3`.
+> Current stable pair: notifier `1.2.0` and cc-connect routing patch
+> `v1.4.1+qr15`.
 
 ## Features
 
@@ -26,6 +27,9 @@ routing changes from the author's `quote-router` branch.
 - `/rw` lists pinned tasks in current sidebar order and runtime status.
 - `/rw3 内容` routes to pinned task 3; `/rw3 /y 内容` submits directly.
 - Quoted normal replies queue while a task is active.
+- Ordinary queued replies are written to Codex Desktop's native queue above
+  the composer, where they can be edited, reordered, or removed; the notifier
+  queue is retained as a fallback when the native transport is unavailable.
 - Quoting a queue acknowledgement and replying `/y` directly submits the
   original queued message.
 - `/rwpush` toggles final-answer push notifications.
@@ -39,30 +43,43 @@ routing changes from the author's `quote-router` branch.
 - Windows 10/11, PowerShell 7 recommended.
 - Python 3.11 or newer. Runtime code uses only the standard library.
 - Codex Desktop with its local task database and CDP endpoint enabled.
-- `cc-connect` configured with the Weixin platform and matching router token.
+- First-time setup can log into Weixin by QR code; no separate cc-connect
+  download or build is required.
 
 ## Install
 
-1. Copy `config.example.json` to `config.json` and replace every placeholder.
-   Generate a long random `router_token`; use the same value in cc-connect's
-   `codex_quote_router_token` option.
-2. Set cc-connect's `codex_quote_router_url` to
-   `http://127.0.0.1:18765/route`.
-3. Verify the configuration without starting the service:
+End users only need this repository; they do not need to visit the cc-connect
+fork:
+
+1. Download the `windows-x64.zip` and matching `.sha256` files from this
+   repository's [latest Release](https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/releases/latest).
+2. Verify and extract the archive:
 
    ```powershell
-   python .\notifier.py --config .\config.json --selftest
+   $zip = Get-Item .\cc-connect-codex-wechat-router-*-windows-x64.zip
+   $expected = ((Get-Content "$($zip.FullName).sha256") -split '\s+')[0]
+   (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower() -eq $expected
+   Expand-Archive $zip.FullName -DestinationPath .\cc-connect-router
+   Set-Location .\cc-connect-router
    ```
 
-4. Register the per-user scheduled task:
+   The checksum result must be `True`.
+
+3. Enter the extracted directory and run the guided installer:
 
    ```powershell
-   pwsh -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 `
-     -ConfigPath (Join-Path $PWD 'config.json')
+   pwsh -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1
    ```
+
+The installer verifies and installs the bundled cc-connect binary, offers QR
+login for new Weixin users, discovers Codex/Python/database paths, generates a
+shared router token, backs up existing configuration, and registers both
+scheduled tasks. If multiple Weixin projects exist, rerun with
+`-CcProject 'project-name'`.
 
 The first run establishes a file-offset baseline and does not resend historical
-answers. Runtime state is written to the configured `data` path.
+answers. Advanced users can still use `config.example.json`, `install.ps1`, and
+the source-build commands below.
 
 After installation, send `/rw` in Weixin. A pinned-task list confirms that the
 notifier, local router, and Weixin response path are connected.
@@ -106,6 +123,19 @@ When a notification beginning with `【聊天名称】` arrives, quote the compl
    notification and send your reply. Idle tasks accept it immediately. Replies
    to active tasks are queued by default, and Weixin reports how many messages
    are ahead in the queue.
+
+By default, the message is inserted into the target task's native Codex
+Desktop queued-follow-up list above the composer. Desktop submits it in order,
+and you can edit, reorder, or remove it from the Desktop UI. The notifier keeps
+only a tracking record so quoting the queue acknowledgement and replying `/y`
+can promote that exact item. If the native Desktop transport is unavailable,
+the durable notifier queue is used automatically as a fallback.
+
+The acknowledgement also lists the content of every currently queued message
+for that task in execution order, including the newly submitted item. Multiline
+content is collapsed onto one line. Very long items or unusually large queues
+are shortened only in the Weixin preview; the original Desktop queue is not
+modified.
 
 Prefix a message with `/y` to submit it directly, for example:
 
@@ -161,6 +191,10 @@ acknowledgements say:
 ```text
 收到，已提交【聊天名称】，排队中（前方x条）。
 引用这条提示回复"/y"直接提交本条消息。
+
+当前队列：
+1.第一条排队消息
+2.第二条排队消息
 ```
 
 ## Development
@@ -192,11 +226,11 @@ upstream `v1.4.1`. Build and deploy from that fork with explicit paths:
 pwsh -NoProfile -File .\build-quote-router.ps1 `
   -SourceRoot 'C:\src\cc-connect' `
   -OutputRoot (Join-Path $PWD 'artifacts') `
-  -PatchVersion 1
+  -PatchVersion 15
 pwsh -NoProfile -File .\deploy-quote-router.ps1 `
   -SourceRoot (Join-Path $PWD 'artifacts') `
   -NotifierConfig (Join-Path $PWD 'config.json') `
-  -PatchVersion 1
+  -PatchVersion 15
 ```
 
 Deployment verifies executable version, SHA-256, loopback health, scheduled

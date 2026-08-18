@@ -6,6 +6,7 @@ changes are maintained in the `quote-router` branch of the author's cc-connect
 fork and are based on upstream `v1.4.1`.
 
 The notifier itself is maintained separately so upstream cc-connect can be
-updated without copying its entire source tree into this repository. Review
-the upstream project's license and notices before redistributing a combined
-binary.
+updated without copying its entire source tree into this repository. Combined
+GitHub Releases build the pinned fork commit in CI and include its provenance,
+checksum, and third-party notice without copying the upstream source tree into
+this repository.

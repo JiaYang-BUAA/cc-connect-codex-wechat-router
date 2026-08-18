@@ -1,0 +1,96 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CC_CONNECT_REF: c9fc393211e50348a4b0637971d0646f3efdad11
+  CC_CONNECT_PATCH_VERSION: '15'
+
+jobs:
+  windows-bundle:
+    runs-on: windows-latest
+    steps:
+      - name: Check out notifier
+        uses: actions/checkout@v4
+
+      - name: Check out pinned cc-connect source
+        uses: actions/checkout@v4
+        with:
+          repository: JiaYang-BUAA/cc-connect
+          ref: ${{ env.CC_CONNECT_REF }}
+          path: cc-connect-source
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: cc-connect-source/web/pnpm-lock.yaml
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.0'
+          cache-dependency-path: cc-connect-source/go.sum
+
+      - name: Validate notifier
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests -v
+          .\tools\check-public-repo.ps1
+
+      - name: Validate cc-connect Weixin package
+        shell: pwsh
+        working-directory: cc-connect-source
+        run: go test ./platform/weixin/...
+
+      - name: Build combined Windows package
+        shell: pwsh
+        run: |
+          $version = '${{ github.ref_name }}'.TrimStart('v')
+          .\tools\build-release-package.ps1 `
+            -CcConnectSourceRoot (Join-Path $PWD 'cc-connect-source') `
+            -NotifierVersion $version `
+            -CcConnectPatchVersion ([int]$env:CC_CONNECT_PATCH_VERSION)
+
+      - name: Test guided installer from packaged files
+        shell: pwsh
+        run: |
+          $archive = Get-ChildItem -LiteralPath .\dist -Filter '*.zip' | Select-Object -First 1
+          .\tools\test-release-package.ps1 -ArchivePath $archive.FullName
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-bundle
+          path: |
+            dist/*.zip
+            dist/*.sha256
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create '${{ github.ref_name }}' `
+            .\dist\*.zip .\dist\*.sha256 `
+            --repo '${{ github.repository }}' `
+            --verify-tag `
+            --generate-notes `
+            --title '${{ github.ref_name }}'

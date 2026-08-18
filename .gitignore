@@ -19,6 +19,7 @@ __pycache__/
 # Local build/deployment output
 artifacts/
 backups/
+dist/
 *.exe
 *.sha256
 

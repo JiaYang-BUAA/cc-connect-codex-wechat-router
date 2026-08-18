@@ -1,0 +1,31 @@
+language = "zh"
+data_dir = "${USERPROFILE}/.cc-connect/data"
+
+[log]
+level = "info"
+
+[display]
+mode = "compact"
+thinking_messages = false
+tool_messages = false
+
+[[projects]]
+name = "codex"
+
+[projects.agent]
+type = "codex"
+
+[projects.agent.options]
+work_dir = "${USERPROFILE}"
+mode = "default"
+backend = "app-server"
+app_server_url = "ws://127.0.0.1:18766"
+
+[[projects.platforms]]
+type = "weixin"
+
+[projects.platforms.options]
+token = ""
+base_url = "https://ilinkai.weixin.qq.com"
+cdn_base_url = "https://novac2c.cdn.weixin.qq.com/c2c"
+allow_from = ""

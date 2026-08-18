@@ -10,9 +10,13 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from desktop_cdp_transport import (  # noqa: E402
     DesktopCdpClient,
+    build_enqueue_queued_follow_up_expression,
     build_follow_up_expression,
     build_probe_expression,
     build_queued_follow_up_count_expression,
+    build_queued_follow_up_ids_expression,
+    build_queued_follow_up_items_expression,
+    build_remove_queued_follow_up_expression,
     select_primary_codex_target,
     validate_loopback_http_url,
 )
@@ -80,11 +84,56 @@ class DesktopCdpTransportTests(unittest.TestCase):
 
     def test_queued_follow_up_expression_returns_only_count(self):
         expression = build_queued_follow_up_count_expression("thread-1")
-        self.assertIn("findDesktopQueuedFollowUpsQuery", expression)
+        self.assertIn("findDesktopQueuedFollowUpsContext", expression)
         self.assertIn(json.dumps("thread-1"), expression)
         self.assertIn("queuedCount", expression)
         self.assertNotIn("turn/start", expression)
         self.assertNotIn("queuedForThread,", expression)
+
+    def test_queued_follow_up_ids_expression_returns_only_ids(self):
+        expression = build_queued_follow_up_ids_expression("thread-1")
+        self.assertIn("findDesktopQueuedFollowUpsContext", expression)
+        self.assertIn(json.dumps("thread-1"), expression)
+        self.assertIn("queuedIds", expression)
+        self.assertNotIn("item?.text", expression)
+
+    def test_queued_follow_up_items_expression_returns_ordered_previews(self):
+        expression = build_queued_follow_up_items_expression("thread-1")
+        self.assertIn("findDesktopQueuedFollowUpsContext", expression)
+        self.assertIn("queuedItems", expression)
+        self.assertIn("item?.text", expression)
+        self.assertIn("item?.context?.prompt", expression)
+        self.assertIn("createdAt", expression)
+
+    def test_enqueue_queued_follow_up_uses_native_state_and_cache(self):
+        expression = build_enqueue_queued_follow_up_expression(
+            "thread-1",
+            "继续处理",
+            r"E:\\codex",
+            "message-1",
+            1_700_000_000_000,
+        )
+        self.assertIn("findDesktopManager", expression)
+        self.assertIn("'get-global-state'", expression)
+        self.assertIn("'set-global-state'", expression)
+        self.assertIn("'queued-follow-ups'", expression)
+        self.assertIn("'codex-queued-follow-up-state'", expression)
+        self.assertIn("queryClient.setQueryData", expression)
+        self.assertIn('"id":"message-1"', expression)
+        self.assertIn('"prompt":' + json.dumps("继续处理", ensure_ascii=True), expression)
+        self.assertIn("queuedItems: messages.map", expression)
+        self.assertNotIn("turn/start", expression)
+
+    def test_remove_queued_follow_up_uses_native_state_and_cache(self):
+        expression = build_remove_queued_follow_up_expression(
+            "thread-1", "message-1"
+        )
+        self.assertIn("findDesktopManager", expression)
+        self.assertIn("'set-global-state'", expression)
+        self.assertIn("'codex-queued-follow-up-state'", expression)
+        self.assertIn("queryClient.setQueryData", expression)
+        self.assertIn('"messageId":"message-1"', expression)
+        self.assertNotIn("turn/start", expression)
 
     def test_send_follow_up_returns_runtime_value(self):
         connection = mock.MagicMock()
@@ -152,6 +201,55 @@ class DesktopCdpTransportTests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 client.get_queued_follow_up_count("thread-1")
+
+    def test_native_queue_client_methods_validate_runtime_values(self):
+        client = DesktopCdpClient("http://127.0.0.1:9335")
+        with mock.patch.object(
+            client,
+            "evaluate",
+            side_effect=[
+                {"ok": True, "queuedIds": ["message-1"]},
+                {
+                    "ok": True,
+                    "inserted": True,
+                    "queuedMessageId": "message-1",
+                    "queuedCount": 1,
+                    "queuedItems": [
+                        {"id": "message-1", "text": "继续", "createdAt": 123}
+                    ],
+                },
+                {"ok": True, "removed": True, "queuedCount": 0},
+            ],
+        ) as evaluate:
+            self.assertEqual(
+                client.get_queued_follow_up_ids("thread-1"), ["message-1"]
+            )
+            self.assertTrue(
+                client.enqueue_queued_follow_up(
+                    "thread-1", "继续", r"E:\\codex", "message-1", 123
+                )["inserted"]
+            )
+            self.assertTrue(
+                client.remove_queued_follow_up("thread-1", "message-1")["removed"]
+            )
+        self.assertEqual(evaluate.call_count, 3)
+
+    def test_get_queued_follow_ups_validates_runtime_value(self):
+        client = DesktopCdpClient("http://127.0.0.1:9335")
+        with mock.patch.object(
+            client,
+            "evaluate",
+            return_value={
+                "ok": True,
+                "queuedItems": [
+                    {"id": "one", "text": "第一条", "createdAt": 100},
+                    {"id": "two", "text": "第二条", "createdAt": 200.0},
+                ],
+            },
+        ):
+            items = client.get_queued_follow_ups("thread-1")
+        self.assertEqual([item["text"] for item in items], ["第一条", "第二条"])
+        self.assertEqual(items[1]["createdAt"], 200)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,10 @@
 name: release
 
 on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
   push:
     tags:
       - 'v*'
@@ -63,7 +67,11 @@ jobs:
       - name: Build combined Windows package
         shell: pwsh
         run: |
-          $version = '${{ github.ref_name }}'.TrimStart('v')
+          $version = if ('${{ github.ref_type }}' -eq 'tag') {
+            '${{ github.ref_name }}'.TrimStart('v')
+          } else {
+            '1.2.0-ci'
+          }
           .\tools\build-release-package.ps1 `
             -CcConnectSourceRoot (Join-Path $PWD 'cc-connect-source') `
             -NotifierVersion $version `
@@ -84,6 +92,7 @@ jobs:
             dist/*.sha256
 
       - name: Create GitHub release
+        if: github.ref_type == 'tag'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}

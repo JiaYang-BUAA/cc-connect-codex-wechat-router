@@ -57,25 +57,25 @@ class DesktopCdpTransportTests(unittest.TestCase):
             model="gpt-5.6-sol",
             reasoning_effort="high",
         )
-        self.assertIn("send-follow-up-message", expression)
-        self.assertIn("app-initial-", expression)
+        self.assertIn("findDesktopRequestClient", expression)
+        self.assertIn("thread/resume", expression)
+        self.assertIn("turn/start", expression)
         self.assertIn(json.dumps("thread-1"), expression)
-        self.assertIn("Promise.race", expression)
         self.assertIn("requestState", expression)
-        self.assertIn("1000", expression)
         self.assertIn('"model":"gpt-5.6-sol"', expression)
-        self.assertIn('"reasoningEffort":"high"', expression)
+        self.assertIn('"effort":"high"', expression)
         self.assertNotIn("引号'\"和换行\n测试", expression)
 
     def test_expression_omits_unavailable_model_preferences(self):
         expression = build_follow_up_expression("thread-1", "继续")
         self.assertNotIn('\\"model\\":null', expression)
-        self.assertNotIn('\\"reasoningEffort\\":null', expression)
+        self.assertNotIn('\\"effort\\":null', expression)
 
     def test_probe_expression_does_not_submit(self):
         expression = build_probe_expression()
         self.assertIn("requestExport", expression)
-        self.assertNotIn("send-follow-up-message", expression)
+        self.assertIn("findDesktopRequestClient", expression)
+        self.assertNotIn("turn/start", expression)
 
     def test_send_follow_up_returns_runtime_value(self):
         connection = mock.MagicMock()
@@ -120,7 +120,7 @@ class DesktopCdpTransportTests(unittest.TestCase):
         self.assertEqual(result["requestExport"], "qTt")
         sent = connection.send_json.call_args.args[0]
         self.assertEqual(sent["method"], "Runtime.evaluate")
-        self.assertIn('"reasoningEffort":"high"', sent["params"]["expression"])
+        self.assertIn('"effort":"high"', sent["params"]["expression"])
         connection.close.assert_called_once_with()
 
 

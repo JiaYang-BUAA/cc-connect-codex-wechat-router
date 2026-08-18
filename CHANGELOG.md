@@ -5,6 +5,13 @@ Python notifier unless a cc-connect routing patch is named explicitly.
 
 ## [Unreleased]
 
+- Added pinned Codex Desktop automation targets to `/rw`, final-answer push,
+  numbered submission, and quoted-reply routing. New scheduled run results are
+  routed back to the pinned automation target without replaying old runs.
+- Added optional `/rwfolder` notifications for every task inside pinned Codex
+  Desktop projects, with quoted replies routed back to the originating task.
+- Updated Codex Desktop submission to use the current in-app AppServer request
+  client after the previous bundled-function export was removed.
 - Expanded the in-Weixin `/hp` guide for first-time users.
 - Improved deployment validation so expected shutdown logs do not trigger a
   false rollback.

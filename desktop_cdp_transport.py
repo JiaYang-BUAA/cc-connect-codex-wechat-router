@@ -9,6 +9,55 @@ from urllib.parse import urlsplit
 from websocket_transport import WebSocketConnection
 
 
+DESKTOP_REQUEST_CLIENT_LOOKUP = r"""
+  function findDesktopRequestClient() {
+    const root = window.__codexRoot?._internalRoot?.current;
+    if (!root) throw new Error('Codex Desktop React root was not found');
+    const queue = [root];
+    const seen = new WeakSet();
+    let cursor = 0;
+    let visited = 0;
+    while (cursor < queue.length && visited < 200000) {
+      const value = queue[cursor++];
+      if (
+        value == null ||
+        (typeof value !== 'object' && typeof value !== 'function') ||
+        seen.has(value)
+      ) continue;
+      seen.add(value);
+      visited += 1;
+      try {
+        if (
+          typeof value.sendRequest === 'function' &&
+          value.hostId === 'local' &&
+          value.requestPromises instanceof Map
+        ) return value;
+      } catch {}
+      let descriptors;
+      try {
+        descriptors = Object.getOwnPropertyDescriptors(value);
+      } catch {
+        continue;
+      }
+      for (const descriptor of Object.values(descriptors)) {
+        if (!Object.prototype.hasOwnProperty.call(descriptor, 'value')) continue;
+        const child = descriptor.value;
+        if (
+          child != null &&
+          (typeof child === 'object' || typeof child === 'function')
+        ) queue.push(child);
+      }
+      if (value instanceof Map) {
+        for (const [key, child] of value) queue.push(key, child);
+      } else if (value instanceof Set) {
+        for (const child of value) queue.push(child);
+      }
+    }
+    throw new Error('Codex Desktop AppServer request client was not found');
+  }
+""".strip()
+
+
 def validate_loopback_http_url(url: str) -> tuple[str, int]:
     parsed = urlsplit(url)
     if parsed.scheme != "http":
@@ -41,15 +90,14 @@ def build_follow_up_expression(
     reasoning_effort: str | None = None,
 ) -> str:
     request_payload: dict[str, Any] = {
-        "hostId": "local",
-        "conversationId": thread_id,
-        "messageMetadata": None,
-        "prompt": prompt,
+        "threadId": thread_id,
+        "input": [{"type": "text", "text": prompt}],
+        "approvalPolicy": "never",
     }
     if model:
         request_payload["model"] = model
     if reasoning_effort:
-        request_payload["reasoningEffort"] = reasoning_effort
+        request_payload["effort"] = reasoning_effort
     payload = json.dumps(
         request_payload,
         ensure_ascii=False,
@@ -57,77 +105,40 @@ def build_follow_up_expression(
     )
     return f"""
 (async () => {{
-  const entryUrl = [...document.scripts]
-    .map((script) => script.src)
-    .find((src) => src.includes('/assets/index-'));
-  if (!entryUrl) throw new Error('Codex Desktop entry module was not found');
-  const entrySource = await fetch(entryUrl).then((response) => response.text());
-  const moduleMatch = entrySource.match(/\\.\\/(app-initial-[A-Za-z0-9_-]+\\.js)/);
-  if (!moduleMatch) throw new Error('Codex Desktop app module was not found');
-  const scriptUrl = new URL(moduleMatch[1], entryUrl).href;
-  const appSource = await fetch(scriptUrl).then((response) => response.text());
-  const bridgeMatch = appSource.match(
-    /function ([A-Za-z_$][A-Za-z0-9_$]*)\\(e,t,n\\)\\{{return n==null\\?([A-Za-z_$][A-Za-z0-9_$]*)\\.sendRequest\\(e,t\\):\\2\\.sendRequest\\(e,t,n\\)\\}}/
+  {DESKTOP_REQUEST_CLIENT_LOOKUP}
+  const request = findDesktopRequestClient();
+  const payload = {payload};
+  await request.sendRequest(
+    'thread/resume',
+    {{ threadId: payload.threadId }},
+    {{ priority: 'critical', source: 'wechat_quote' }}
   );
-  if (!bridgeMatch) throw new Error('Codex Desktop request bridge was not found');
-  const exportMatch = appSource.match(
-    new RegExp(bridgeMatch[1] + ' as ([A-Za-z_$][A-Za-z0-9_$]*)')
+  const result = await request.sendRequest(
+    'turn/start',
+    payload,
+    {{ priority: 'critical', source: 'wechat_quote' }}
   );
-  if (!exportMatch) throw new Error('Codex Desktop request export was not found');
-  const module = await import(scriptUrl);
-  const request = module[exportMatch[1]];
-  if (typeof request !== 'function') {{
-    throw new Error('Codex Desktop request export is not callable');
-  }}
-  const requestOutcome = Promise.resolve(
-    request('send-follow-up-message', {payload})
-  ).then(
-    () => ({{ state: 'completed' }}),
-    (error) => {{ throw error; }}
-  );
-  const outcome = await Promise.race([
-    requestOutcome,
-    new Promise((resolve) => setTimeout(
-      () => resolve({{ state: 'dispatched' }}),
-      1000
-    )),
-  ]);
   return {{
     ok: true,
-    requestExport: exportMatch[1],
-    requestState: outcome.state,
+    requestExport: 'react-fiber-app-server',
+    requestState: 'dispatched',
+    turnId: result?.turn?.id ?? null,
   }};
 }})()
 """.strip()
 
 
 def build_probe_expression() -> str:
-    return """
-(async () => {
-  const entryUrl = [...document.scripts]
-    .map((script) => script.src)
-    .find((src) => src.includes('/assets/index-'));
-  if (!entryUrl) throw new Error('Codex Desktop entry module was not found');
-  const entrySource = await fetch(entryUrl).then((response) => response.text());
-  const moduleMatch = entrySource.match(/\\.\\/(app-initial-[A-Za-z0-9_-]+\\.js)/);
-  if (!moduleMatch) throw new Error('Codex Desktop app module was not found');
-  const scriptUrl = new URL(moduleMatch[1], entryUrl).href;
-  const appSource = await fetch(scriptUrl).then((response) => response.text());
-  const bridgeMatch = appSource.match(
-    /function ([A-Za-z_$][A-Za-z0-9_$]*)\\(e,t,n\\)\\{return n==null\\?([A-Za-z_$][A-Za-z0-9_$]*)\\.sendRequest\\(e,t\\):\\2\\.sendRequest\\(e,t,n\\)\\}/
-  );
-  if (!bridgeMatch) throw new Error('Codex Desktop request bridge was not found');
-  const exportMatch = appSource.match(
-    new RegExp(bridgeMatch[1] + ' as ([A-Za-z_$][A-Za-z0-9_$]*)')
-  );
-  if (!exportMatch) throw new Error('Codex Desktop request export was not found');
-  const module = await import(scriptUrl);
-  const request = module[exportMatch[1]];
-  if (typeof request !== 'function') {
-    throw new Error('Codex Desktop request export is not callable');
-  }
-  return { ok: true, requestExport: exportMatch[1], functionName: request.name };
-})()
+    return f"""
+(async () => {{
+  {DESKTOP_REQUEST_CLIENT_LOOKUP}
+  const request = findDesktopRequestClient();
+  return {{
+    ok: true,
+    requestExport: 'react-fiber-app-server',
+    functionName: request.sendRequest.name || 'sendRequest',
+  }};
+}})()
 """.strip()
 
 

@@ -12,6 +12,7 @@ from desktop_cdp_transport import (  # noqa: E402
     DesktopCdpClient,
     build_follow_up_expression,
     build_probe_expression,
+    build_queued_follow_up_count_expression,
     select_primary_codex_target,
     validate_loopback_http_url,
 )
@@ -77,6 +78,14 @@ class DesktopCdpTransportTests(unittest.TestCase):
         self.assertIn("findDesktopRequestClient", expression)
         self.assertNotIn("turn/start", expression)
 
+    def test_queued_follow_up_expression_returns_only_count(self):
+        expression = build_queued_follow_up_count_expression("thread-1")
+        self.assertIn("findDesktopQueuedFollowUpsQuery", expression)
+        self.assertIn(json.dumps("thread-1"), expression)
+        self.assertIn("queuedCount", expression)
+        self.assertNotIn("turn/start", expression)
+        self.assertNotIn("queuedForThread,", expression)
+
     def test_send_follow_up_returns_runtime_value(self):
         connection = mock.MagicMock()
         connection.iter_text.return_value = iter(
@@ -122,6 +131,27 @@ class DesktopCdpTransportTests(unittest.TestCase):
         self.assertEqual(sent["method"], "Runtime.evaluate")
         self.assertIn('"effort":"high"', sent["params"]["expression"])
         connection.close.assert_called_once_with()
+
+    def test_get_queued_follow_up_count_returns_runtime_value(self):
+        client = DesktopCdpClient("http://127.0.0.1:9335")
+        with mock.patch.object(
+            client,
+            "evaluate",
+            return_value={"ok": True, "queuedCount": 2},
+        ) as evaluate:
+            count = client.get_queued_follow_up_count("thread-1")
+        self.assertEqual(count, 2)
+        self.assertIn("queuedCount", evaluate.call_args.args[0])
+
+    def test_get_queued_follow_up_count_rejects_invalid_value(self):
+        client = DesktopCdpClient("http://127.0.0.1:9335")
+        with mock.patch.object(
+            client,
+            "evaluate",
+            return_value={"ok": True, "queuedCount": "2"},
+        ):
+            with self.assertRaises(RuntimeError):
+                client.get_queued_follow_up_count("thread-1")
 
 
 if __name__ == "__main__":

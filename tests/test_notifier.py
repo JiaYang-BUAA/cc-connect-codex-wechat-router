@@ -1069,18 +1069,23 @@ codex_quote_router_token = "test-secret-token"
                 message,
                 20,
             )
-            status, response = notifier.enqueue_quote_reply(
-                config,
-                state,
-                state_path,
-                threading.RLock(),
-                {
-                    "quote_text": message,
-                    "reply_text": "继续排队",
-                    "message_id": "m1",
-                    "user_id": "u1",
-                },
-            )
+            with mock.patch.object(
+                notifier,
+                "read_desktop_queued_follow_up_count",
+                return_value=0,
+            ):
+                status, response = notifier.enqueue_quote_reply(
+                    config,
+                    state,
+                    state_path,
+                    threading.RLock(),
+                    {
+                        "quote_text": message,
+                        "reply_text": "继续排队",
+                        "message_id": "m1",
+                        "user_id": "u1",
+                    },
+                )
             self.assertEqual(status, 200)
             self.assertEqual(
                 response,
@@ -1269,6 +1274,107 @@ codex_quote_router_token = "test-secret-token"
             submit.assert_called_once_with(config, "thread-1", "直接补充")
             self.assertEqual(len(state["reply_queue"]), 1)
             self.assertEqual(state["reply_queue"][0]["status"], "queued")
+
+    def test_queue_count_includes_desktop_follow_ups(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rollout, _, config = self.make_fixture(root)
+            self.append_started(rollout, "active-turn")
+            state_path = root / "state.json"
+            state = notifier.empty_state()
+            message = "【科研】\n答复\n\n↩ 引用此条信息进行回复"
+            notifier.remember_quote_route(
+                state,
+                {"thread_id": "thread-1", "turn_id": "turn-1", "title": "科研"},
+                message,
+                20,
+            )
+
+            def desktop_count_before_enqueue(_config, thread_id):
+                self.assertEqual(thread_id, "thread-1")
+                self.assertEqual(state["reply_queue"], [])
+                return 1
+
+            with mock.patch.object(
+                notifier,
+                "read_desktop_queued_follow_up_count",
+                side_effect=desktop_count_before_enqueue,
+            ) as desktop_count:
+                status, response = notifier.enqueue_quote_reply(
+                    config,
+                    state,
+                    state_path,
+                    threading.RLock(),
+                    {
+                        "quote_text": message,
+                        "reply_text": "微信排队",
+                        "message_id": "m-desktop-ahead",
+                        "user_id": "u1",
+                    },
+                )
+
+            self.assertEqual(status, 200)
+            self.assertIn("排队中（前方1条）", response)
+            desktop_count.assert_called_once_with(config, "thread-1")
+
+    def test_queue_count_combines_desktop_and_wechat_follow_ups(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rollout, _, config = self.make_fixture(root)
+            self.append_started(rollout, "active-turn")
+            state_path = root / "state.json"
+            state = notifier.empty_state()
+            state["reply_queue"].append(
+                {
+                    "request_id": "wechat-ahead",
+                    "thread_id": "thread-1",
+                    "status": "queued",
+                }
+            )
+            message = "【科研】\n答复\n\n↩ 引用此条信息进行回复"
+            notifier.remember_quote_route(
+                state,
+                {"thread_id": "thread-1", "turn_id": "turn-1", "title": "科研"},
+                message,
+                20,
+            )
+
+            with mock.patch.object(
+                notifier,
+                "read_desktop_queued_follow_up_count",
+                return_value=1,
+            ):
+                status, response = notifier.enqueue_quote_reply(
+                    config,
+                    state,
+                    state_path,
+                    threading.RLock(),
+                    {
+                        "quote_text": message,
+                        "reply_text": "第二条微信排队",
+                        "message_id": "m-combined-ahead",
+                        "user_id": "u1",
+                    },
+                )
+
+            self.assertEqual(status, 200)
+            self.assertIn("排队中（前方2条）", response)
+
+    def test_desktop_queue_count_failure_falls_back_to_wechat_queue(self):
+        config = {
+            "codex_desktop_cdp_url": "http://127.0.0.1:9335",
+            "codex_desktop_cdp_timeout_seconds": 3,
+        }
+        client = mock.MagicMock()
+        client.get_queued_follow_up_count.side_effect = RuntimeError("unavailable")
+        with (
+            mock.patch.object(notifier, "DesktopCdpClient", return_value=client),
+            self.assertLogs("codex_pinned_wechat_notifier", level="WARNING"),
+        ):
+            count = notifier.read_desktop_queued_follow_up_count(
+                config, "thread-1"
+            )
+        self.assertEqual(count, 0)
 
     def test_y_prefix_steers_wechat_owned_active_turn(self):
         class FakeClient:

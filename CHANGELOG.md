@@ -5,6 +5,8 @@ Python notifier unless a cc-connect routing patch is named explicitly.
 
 ## [Unreleased]
 
+- Fixed queued-reply acknowledgements to count both Codex Desktop's native
+  queued follow-ups and earlier WeChat replies for the same task.
 - Added pinned Codex Desktop automation targets to `/rw`, final-answer push,
   numbered submission, and quoted-reply routing. New scheduled run results are
   routed back to the pinned automation target without replaying old runs.

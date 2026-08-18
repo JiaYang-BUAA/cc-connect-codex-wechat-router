@@ -1383,6 +1383,27 @@ def submit_desktop_reply(
         return False, str(exc)
 
 
+def read_desktop_queued_follow_up_count(
+    config: dict[str, Any], thread_id: str
+) -> int:
+    base_url = str(config.get("codex_desktop_cdp_url") or "")
+    if not base_url:
+        return 0
+    try:
+        client = DesktopCdpClient(
+            base_url,
+            float(config.get("codex_desktop_cdp_timeout_seconds", 30)),
+        )
+        return client.get_queued_follow_up_count(thread_id)
+    except (OSError, RuntimeError, TimeoutError, ValueError, KeyError) as exc:
+        logging.getLogger("codex_pinned_wechat_notifier").warning(
+            "Could not read Codex Desktop queued follow-up count thread=%s: %s",
+            thread_id,
+            exc,
+        )
+        return 0
+
+
 def trim_sent_history(state: dict[str, Any], limit: int) -> None:
     sent = state["sent_turns"]
     if len(sent) <= limit:
@@ -1753,6 +1774,13 @@ def enqueue_thread_reply(
         return 200, f"【{title}】直接提交未成功，已优先排队。"
 
     runtime = latest_thread_runtime(str(thread.get("rollout_path") or ""))
+    # Avoid holding the state lock during CDP I/O, then recheck for races below.
+    with state_lock:
+        if request_id in state["handled_message_ids"] or any(
+            item.get("request_id") == request_id for item in state["reply_queue"]
+        ):
+            return 200, "收到"
+    desktop_ahead = read_desktop_queued_follow_up_count(config, thread_id)
     with state_lock:
         if request_id in state["handled_message_ids"] or any(
             item.get("request_id") == request_id for item in state["reply_queue"]
@@ -1773,13 +1801,14 @@ def enqueue_thread_reply(
             }
         )
         save_state(state_path, state)
-        ahead = sum(
+        wechat_ahead = sum(
             1
             for item in state["reply_queue"]
             if str(item.get("thread_id")) == thread_id
             and item.get("status") == "queued"
             and item.get("request_id") != request_id
         )
+        ahead = desktop_ahead + wechat_ahead
     if runtime.get("active") or ahead:
         response = (
             f"收到，已提交【{title}】，排队中（前方{ahead}条）。\n"

@@ -58,6 +58,64 @@ DESKTOP_REQUEST_CLIENT_LOOKUP = r"""
 """.strip()
 
 
+DESKTOP_QUEUED_FOLLOW_UP_LOOKUP = r"""
+  function findDesktopQueuedFollowUpsQuery() {
+    const root = window.__codexRoot?._internalRoot?.current;
+    if (!root) throw new Error('Codex Desktop React root was not found');
+    const queue = [root];
+    const seen = new WeakSet();
+    let cursor = 0;
+    let visited = 0;
+    while (cursor < queue.length && visited < 200000) {
+      const value = queue[cursor++];
+      if (
+        value == null ||
+        (typeof value !== 'object' && typeof value !== 'function') ||
+        seen.has(value)
+      ) continue;
+      seen.add(value);
+      visited += 1;
+      try {
+        if (typeof value.getQueryCache === 'function') {
+          const queries = value.getQueryCache().getAll();
+          if (Array.isArray(queries)) {
+            const query = queries.find((candidate) => {
+              const key = candidate?.queryKey;
+              return (
+                Array.isArray(key) &&
+                key.includes('get-global-state') &&
+                JSON.stringify(key).includes('queued-follow-ups')
+              );
+            });
+            if (query) return query;
+          }
+        }
+      } catch {}
+      let descriptors;
+      try {
+        descriptors = Object.getOwnPropertyDescriptors(value);
+      } catch {
+        continue;
+      }
+      for (const descriptor of Object.values(descriptors)) {
+        if (!Object.prototype.hasOwnProperty.call(descriptor, 'value')) continue;
+        const child = descriptor.value;
+        if (
+          child != null &&
+          (typeof child === 'object' || typeof child === 'function')
+        ) queue.push(child);
+      }
+      if (value instanceof Map) {
+        for (const [key, child] of value) queue.push(key, child);
+      } else if (value instanceof Set) {
+        for (const child of value) queue.push(child);
+      }
+    }
+    throw new Error('Codex Desktop queued follow-up cache was not found');
+  }
+""".strip()
+
+
 def validate_loopback_http_url(url: str) -> tuple[str, int]:
     parsed = urlsplit(url)
     if parsed.scheme != "http":
@@ -142,6 +200,22 @@ def build_probe_expression() -> str:
 """.strip()
 
 
+def build_queued_follow_up_count_expression(thread_id: str) -> str:
+    encoded_thread_id = json.dumps(thread_id, ensure_ascii=True)
+    return f"""
+(() => {{
+  {DESKTOP_QUEUED_FOLLOW_UP_LOOKUP}
+  const query = findDesktopQueuedFollowUpsQuery();
+  const queuedByThread = query?.state?.data?.value;
+  const queuedForThread = queuedByThread?.[{encoded_thread_id}];
+  return {{
+    ok: true,
+    queuedCount: Array.isArray(queuedForThread) ? queuedForThread.length : 0,
+  }};
+}})()
+""".strip()
+
+
 class DesktopCdpClient:
     def __init__(self, base_url: str, timeout_seconds: float = 30.0):
         self.host, self.port = validate_loopback_http_url(base_url)
@@ -219,6 +293,13 @@ class DesktopCdpClient:
 
     def probe(self) -> dict[str, Any]:
         return self.evaluate(build_probe_expression())
+
+    def get_queued_follow_up_count(self, thread_id: str) -> int:
+        result = self.evaluate(build_queued_follow_up_count_expression(thread_id))
+        count = result.get("queuedCount")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise RuntimeError("Codex Desktop returned an invalid queued follow-up count")
+        return count
 
     def send_follow_up(
         self,

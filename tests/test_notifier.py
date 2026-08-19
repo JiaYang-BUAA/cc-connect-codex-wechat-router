@@ -722,9 +722,23 @@ codex_quote_router_token = "test-secret-token"
             )
             with mock.patch.object(notifier.time, "time", return_value=1776254465):
                 message = notifier.format_pinned_task_status(config, state)
+            self.assertTrue(
+                message.startswith(
+                    "置顶任务回复推送：已开启\n"
+                    "置顶文件夹任务回复推送：已关闭\n\n"
+                    "置顶任务（1）\n"
+                )
+            )
             self.assertIn("【测试任务】运行中｜已处理", message)
             self.assertIn("排队 2", message)
-            self.assertIn("置顶文件夹推送：已关闭", message)
+            self.assertIn("置顶任务回复推送：已开启", message)
+            self.assertIn("置顶文件夹任务回复推送：已关闭", message)
+
+            state["push_enabled"] = False
+            state["pinned_project_push_enabled"] = True
+            message = notifier.format_pinned_task_status(config, state)
+            self.assertIn("置顶任务回复推送：已关闭", message)
+            self.assertIn("置顶文件夹任务回复推送：已开启", message)
 
     def test_quote_route_matches_without_storing_answer(self):
         state = notifier.empty_state()

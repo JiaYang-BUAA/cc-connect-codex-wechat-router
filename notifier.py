@@ -694,13 +694,15 @@ def format_pinned_task_status(
     threads = read_desktop_threads(config)
     pinned = [thread for thread in threads if bool(thread.get("is_pinned"))]
     project_count = sum(bool(thread.get("is_project_pinned")) for thread in threads)
+    pinned_push = bool(state.get("push_enabled", True))
     project_push = bool(state.get("pinned_project_push_enabled", False))
+    pinned_line = f"置顶任务回复推送：{'已开启' if pinned_push else '已关闭'}"
     project_line = (
-        f"置顶文件夹推送：{'已开启' if project_push else '已关闭'}"
+        f"置顶文件夹任务回复推送：{'已开启' if project_push else '已关闭'}"
         + (f"（当前 {project_count} 个对话）" if project_push else "")
     )
     if not pinned:
-        return f"当前没有单独置顶任务。\n{project_line}"
+        return f"{pinned_line}\n{project_line}\n\n当前没有单独置顶任务。"
     active_sessions = active_sessions or {}
     now = time.time()
     automation_runtimes: dict[str, dict[str, Any]] = {}
@@ -714,7 +716,7 @@ def format_pinned_task_status(
             current.get("started_at") or now
         ):
             automation_runtimes[target_id] = runtime
-    lines = [f"置顶任务（{len(pinned)}）", project_line]
+    lines = [pinned_line, project_line, "", f"置顶任务（{len(pinned)}）"]
     for index, thread in enumerate(pinned, 1):
         thread_id = str(thread["id"])
         session = active_sessions.get(thread_id)

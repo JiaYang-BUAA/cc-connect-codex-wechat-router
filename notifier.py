@@ -28,7 +28,7 @@ from websocket_transport import SharedAppServerProcess, WebSocketConnection
 
 
 STATE_VERSION = 2
-NOTIFIER_VERSION = "1.2.0"
+NOTIFIER_VERSION = "1.2.1"
 QUOTE_FOOTER = "↩ 引用此条信息进行回复"
 QUEUE_HINT = "如任务正在处理，则默认排队，直接提交请加前缀“/y”"
 WECHAT_BLANK_LINE = "\u200b"
@@ -514,6 +514,20 @@ def find_submitted_reply_turn(
     except OSError:
         return ""
     return ""
+
+
+def reply_failure_is_transient(config: dict[str, Any], detail: str) -> bool:
+    """Keep replies queued while the local Codex submission channel is unhealthy."""
+    if config.get("codex_submit_transport") == "desktop-cdp":
+        return True
+    transient_markers = (
+        "Codex app-server request timed out",
+        "Codex app-server timed out",
+        "Codex app-server WebSocket connection closed",
+        "Codex app-server exited with code",
+        "Codex app-server stdin is unavailable",
+    )
+    return any(marker in detail for marker in transient_markers)
 
 
 def recover_interrupted_reply_requests(
@@ -2659,6 +2673,7 @@ def run_reply_worker(
             return
         thread_id = str(item["thread_id"])
         reply = str(item["reply"])
+        queued_at = int(item.get("queued_at") or 0)
 
     thread = read_desktop_thread(config, thread_id)
     if (
@@ -2676,6 +2691,27 @@ def run_reply_worker(
             active_sessions,
             active_sessions_lock,
         )
+        if not ok:
+            refreshed_thread = read_desktop_thread(config, thread_id)
+            submitted_turn_id = (
+                find_submitted_reply_turn(
+                    str(refreshed_thread.get("rollout_path") or ""),
+                    reply,
+                    queued_at,
+                )
+                if refreshed_thread is not None
+                else ""
+            )
+            if submitted_turn_id:
+                ok = True
+                detail = submitted_turn_id
+                logger.info(
+                    "Recovered submitted WeChat reply after transport failure "
+                    "thread=%s request=%s turn=%s",
+                    thread_id,
+                    request_id,
+                    submitted_turn_id,
+                )
 
     notify_error = ""
     with state_lock:
@@ -2693,18 +2729,22 @@ def run_reply_worker(
                 )
                 logger.info("Quoted WeChat reply completed thread=%s request=%s", thread_id, request_id)
             else:
-                attempts = int(item.get("attempts", 0)) + 1
-                item["attempts"] = attempts
+                transient = reply_failure_is_transient(config, detail)
+                attempt_key = "transient_attempts" if transient else "attempts"
+                attempts = int(item.get(attempt_key, 0)) + 1
+                item[attempt_key] = attempts
                 item["status"] = "queued"
                 item["next_retry_at"] = int(time.time()) + min(1800, 15 * (2 ** min(attempts - 1, 7)))
                 logger.warning(
-                    "Quoted WeChat reply failed thread=%s request=%s attempt=%s error=%s",
+                    "Quoted WeChat reply failed thread=%s request=%s attempt=%s "
+                    "transient=%s error=%s",
                     thread_id,
                     request_id,
                     attempts,
+                    transient,
                     detail[-500:],
                 )
-                if attempts >= int(config["reply_retry_limit"]):
+                if not transient and attempts >= int(config["reply_retry_limit"]):
                     state["reply_queue"].remove(item)
                     state["handled_message_ids"][request_id] = int(time.time())
                     notify_error = f"【{clean_chat_title(str(item['title']))}】\n微信回复未能转交给 Codex：{detail[-300:]}"

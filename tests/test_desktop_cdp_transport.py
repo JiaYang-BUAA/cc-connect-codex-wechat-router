@@ -48,7 +48,10 @@ class DesktopCdpTransportTests(unittest.TestCase):
                 },
                 {
                     "type": "page",
-                    "url": "app://-/index.html",
+                    "url": (
+                        "app://-/index.html?initialRoute="
+                        "%2Flocal%2F01a017a2-6cc1-75a3-9436-943af1bd2518"
+                    ),
                     "webSocketDebuggerUrl": "ws://127.0.0.1:9335/devtools/page/c",
                 },
             ]
@@ -179,6 +182,42 @@ class DesktopCdpTransportTests(unittest.TestCase):
         sent = connection.send_json.call_args.args[0]
         self.assertEqual(sent["method"], "Runtime.evaluate")
         self.assertIn('"effort":"high"', sent["params"]["expression"])
+        connection.close.assert_called_once_with()
+
+    def test_evaluate_enforces_total_deadline_while_events_keep_arriving(self):
+        connection = mock.MagicMock()
+        connection.iter_text.return_value = iter(
+            [
+                json.dumps({"method": "Runtime.consoleAPICalled"}),
+                json.dumps({"method": "Runtime.bindingCalled"}),
+            ]
+        )
+        client = DesktopCdpClient("http://127.0.0.1:9335", timeout_seconds=1)
+        with (
+            mock.patch.object(
+                client,
+                "list_targets",
+                return_value=[
+                    {
+                        "type": "page",
+                        "url": "app://-/index.html?initialRoute=%2Flocal%2Fthread-1",
+                        "webSocketDebuggerUrl": (
+                            "ws://127.0.0.1:9335/devtools/page/test"
+                        ),
+                    }
+                ],
+            ),
+            mock.patch(
+                "desktop_cdp_transport.WebSocketConnection",
+                return_value=connection,
+            ),
+            mock.patch(
+                "desktop_cdp_transport.time.monotonic",
+                side_effect=[0.0, 0.2, 1.1],
+            ),
+        ):
+            with self.assertRaisesRegex(TimeoutError, "request timed out"):
+                client.evaluate("Promise.resolve({ok: true})")
         connection.close.assert_called_once_with()
 
     def test_get_queued_follow_up_count_returns_runtime_value(self):

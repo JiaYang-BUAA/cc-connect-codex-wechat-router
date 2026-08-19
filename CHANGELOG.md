@@ -5,6 +5,17 @@ Python notifier unless a cc-connect routing patch is named explicitly.
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-08-19
+
+- Restored Codex Desktop submission after Desktop added an `initialRoute` query
+  to its primary CDP page URL, while continuing to exclude the avatar overlay.
+- Added a total CDP request deadline so unrelated browser events cannot keep a
+  submission worker blocked indefinitely.
+- Added rollout-based submission recovery after transport failures to avoid
+  submitting the same Weixin reply twice when Desktop accepted the first call.
+- Kept replies durably queued during Desktop and app-server infrastructure
+  outages instead of deleting them after the ordinary retry limit.
+
 ## [1.2.0] - 2026-08-18
 
 - Routed ordinary Weixin follow-ups into Codex Desktop's native queued-follow-up
@@ -38,6 +49,7 @@ Python notifier unless a cc-connect routing patch is named explicitly.
   installation.
 - Added the cc-connect `v1.4.1+qr3` routing companion.
 
-[Unreleased]: https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/releases/tag/v1.2.1
 [1.2.0]: https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/releases/tag/v1.2.0
 [1.1.0]: https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/releases/tag/v1.1.0

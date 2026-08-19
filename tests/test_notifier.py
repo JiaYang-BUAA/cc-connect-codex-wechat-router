@@ -988,6 +988,120 @@ codex_quote_router_token = "test-secret-token"
             self.assertEqual(len(state["reply_queue"]), 1)
             self.assertEqual(state["reply_queue"][0]["status"], "queued")
 
+    def test_reply_worker_recovers_submission_after_transport_timeout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rollout, _, config = self.make_fixture(root)
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "timestamp": "2026-08-19T12:00:10Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "已经进入 Codex"}
+                            ],
+                            "internal_chat_message_metadata_passthrough": {
+                                "turn_id": "turn-submitted"
+                            },
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config.update(
+                {
+                    "codex_submit_transport": "desktop-cdp",
+                    "handled_message_history_limit": 20,
+                    "reply_retry_limit": 1,
+                }
+            )
+            state_path = root / "state.json"
+            state = notifier.empty_state()
+            state["reply_queue"] = [
+                {
+                    "request_id": "request-timeout",
+                    "thread_id": "thread-1",
+                    "title": "测试任务",
+                    "reply": "已经进入 Codex",
+                    "status": "running",
+                    "queued_at": 0,
+                }
+            ]
+            workers = {"thread-1": mock.MagicMock()}
+            with mock.patch.object(
+                notifier,
+                "run_codex_reply",
+                return_value=(False, "Codex Desktop CDP request timed out"),
+            ):
+                notifier.run_reply_worker(
+                    config,
+                    state,
+                    state_path,
+                    threading.RLock(),
+                    workers,
+                    {},
+                    threading.RLock(),
+                    "request-timeout",
+                    notifier.logging.getLogger("test-worker-recovery"),
+                )
+            self.assertEqual(state["reply_queue"], [])
+            self.assertIn("request-timeout", state["handled_message_ids"])
+            self.assertNotIn("thread-1", workers)
+
+    def test_reply_worker_keeps_transient_desktop_failure_past_retry_limit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, config = self.make_fixture(root)
+            config.update(
+                {
+                    "codex_submit_transport": "desktop-cdp",
+                    "handled_message_history_limit": 20,
+                    "reply_retry_limit": 1,
+                }
+            )
+            state_path = root / "state.json"
+            state = notifier.empty_state()
+            state["reply_queue"] = [
+                {
+                    "request_id": "request-transient",
+                    "thread_id": "thread-1",
+                    "title": "测试任务",
+                    "reply": "等待 Desktop 恢复",
+                    "status": "running",
+                    "queued_at": int(time.time()),
+                }
+            ]
+            workers = {"thread-1": mock.MagicMock()}
+            with mock.patch.object(
+                notifier,
+                "run_codex_reply",
+                return_value=(
+                    False,
+                    "Codex Desktop primary page is not available through CDP",
+                ),
+            ):
+                notifier.run_reply_worker(
+                    config,
+                    state,
+                    state_path,
+                    threading.RLock(),
+                    workers,
+                    {},
+                    threading.RLock(),
+                    "request-transient",
+                    notifier.logging.getLogger("test-worker-transient"),
+                )
+            self.assertEqual(len(state["reply_queue"]), 1)
+            self.assertEqual(state["reply_queue"][0]["status"], "queued")
+            self.assertEqual(state["reply_queue"][0]["transient_attempts"], 1)
+            self.assertEqual(state["reply_queue"][0].get("attempts", 0), 0)
+            self.assertNotIn("request-transient", state["handled_message_ids"])
+
     def test_enqueue_quote_reply_routes_only_to_pinned_task(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

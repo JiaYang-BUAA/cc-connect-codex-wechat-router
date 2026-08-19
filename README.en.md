@@ -15,7 +15,7 @@ the upstream cc-connect source. End-user GitHub Releases include a verified
 custom `cc-connect.exe`; its Go source remains in the author's `quote-router`
 fork branch, and every bundle records the pinned source commit.
 
-> Current stable pair: notifier `1.2.0` and cc-connect routing patch
+> Current stable pair: notifier `1.2.1` and cc-connect routing patch
 > `v1.4.1+qr15`.
 
 ## Features

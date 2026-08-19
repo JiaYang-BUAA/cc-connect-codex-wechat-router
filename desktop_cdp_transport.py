@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import json
 import socket
+import time
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -180,13 +181,19 @@ def validate_loopback_http_url(url: str) -> tuple[str, int]:
 
 
 def select_primary_codex_target(targets: list[dict[str, Any]]) -> dict[str, Any]:
-    candidates = [
-        target
-        for target in targets
-        if target.get("type") == "page"
-        and str(target.get("url") or "") == "app://-/index.html"
-        and str(target.get("webSocketDebuggerUrl") or "").startswith("ws://")
-    ]
+    candidates = []
+    for target in targets:
+        target_url = str(target.get("url") or "")
+        parsed = urlsplit(target_url)
+        if (
+            target.get("type") == "page"
+            and parsed.scheme == "app"
+            and parsed.netloc == "-"
+            and parsed.path == "/index.html"
+            and "avatar-overlay" not in parsed.query
+            and str(target.get("webSocketDebuggerUrl") or "").startswith("ws://")
+        ):
+            candidates.append(target)
     if not candidates:
         raise RuntimeError("Codex Desktop primary page is not available through CDP")
     return candidates[0]
@@ -482,6 +489,7 @@ class DesktopCdpClient:
         )
         try:
             connection.socket.settimeout(self.timeout_seconds)
+            deadline = time.monotonic() + self.timeout_seconds
             connection.send_json(
                 {
                     "id": 1,
@@ -495,6 +503,10 @@ class DesktopCdpClient:
                 }
             )
             for text in connection.iter_text():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Codex Desktop CDP request timed out")
+                connection.socket.settimeout(remaining)
                 message = json.loads(text)
                 if message.get("id") != 1:
                     continue
@@ -514,6 +526,8 @@ class DesktopCdpClient:
                         str(remote.get("description") or "Codex Desktop submit failed")
                     )
                 return value
+        except TimeoutError:
+            raise
         except (json.JSONDecodeError, OSError, socket.timeout) as exc:
             raise RuntimeError(f"Codex Desktop CDP request failed: {exc}") from exc
         finally:

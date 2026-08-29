@@ -12,5 +12,9 @@
   "router_token": "GENERATE_A_LONG_RANDOM_TOKEN",
   "codex_submit_transport": "desktop-cdp",
   "codex_desktop_cdp_url": "http://127.0.0.1:9335",
-  "reply_retry_limit": 5
+  "reply_retry_limit": 5,
+  "quota_monitor_enabled": true,
+  "quota_poll_seconds": 60,
+  "quota_warning_percent": 10,
+  "quota_cache_stale_seconds": 180
 }

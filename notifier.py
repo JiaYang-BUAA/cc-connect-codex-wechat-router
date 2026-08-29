@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 from logging.handlers import RotatingFileHandler
+import math
 import msvcrt
 import os
 from pathlib import Path
@@ -64,6 +65,10 @@ def load_config(path: Path) -> dict[str, Any]:
     config.setdefault("codex_desktop_cdp_url", "http://127.0.0.1:9335")
     config.setdefault("codex_desktop_cdp_timeout_seconds", 30)
     config.setdefault("reply_retry_limit", 5)
+    config.setdefault("quota_monitor_enabled", True)
+    config.setdefault("quota_poll_seconds", 60)
+    config.setdefault("quota_warning_percent", 10)
+    config.setdefault("quota_cache_stale_seconds", 180)
     config.setdefault("cc_connect_config", str(Path.home() / ".cc-connect" / "config.toml"))
     config.setdefault(
         "codex_global_state",
@@ -86,6 +91,21 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError("Invalid codex_app_server_transport")
     if config["codex_submit_transport"] not in {"app-server", "desktop-cdp"}:
         raise ValueError("Invalid codex_submit_transport")
+    try:
+        quota_poll_seconds = float(config["quota_poll_seconds"])
+        quota_warning_percent = float(config["quota_warning_percent"])
+        quota_cache_stale_seconds = float(config["quota_cache_stale_seconds"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid quota monitor timing or threshold") from exc
+    if (
+        not math.isfinite(quota_poll_seconds)
+        or not math.isfinite(quota_cache_stale_seconds)
+        or quota_poll_seconds <= 0
+        or quota_cache_stale_seconds <= 0
+    ):
+        raise ValueError("Quota monitor timing must be positive")
+    if not math.isfinite(quota_warning_percent) or not 0 <= quota_warning_percent <= 100:
+        raise ValueError("quota_warning_percent must be between 0 and 100")
     return config
 
 
@@ -126,6 +146,8 @@ def empty_state() -> dict[str, Any]:
         "push_enabled": True,
         "pinned_project_push_enabled": False,
         "automation_runs_initialized": False,
+        "quota_status": {},
+        "quota_alert_stages": {},
     }
 
 
@@ -157,6 +179,8 @@ def load_state(path: Path) -> dict[str, Any]:
     state.setdefault("push_enabled", True)
     state.setdefault("pinned_project_push_enabled", False)
     state.setdefault("automation_runs_initialized", False)
+    state.setdefault("quota_status", {})
+    state.setdefault("quota_alert_stages", {})
     for item in state["pending"]:
         if item.get("delivery_status") == "sending":
             item["delivery_status"] = "queued"
@@ -686,6 +710,136 @@ def read_catalog_titles(config: dict[str, Any], thread_ids: list[str]) -> dict[s
     }
 
 
+def normalize_quota_limits(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return the Codex 5-hour and 7-day quota windows without account data."""
+    bucket = result.get("rateLimits")
+    if not isinstance(bucket, dict):
+        buckets = result.get("rateLimitsByLimitId")
+        bucket = buckets.get("codex") if isinstance(buckets, dict) else None
+    if not isinstance(bucket, dict):
+        raise ValueError("Codex rate limit bucket is unavailable")
+
+    windows: dict[str, dict[str, Any]] = {}
+    for key, field, expected_minutes in (
+        ("5h", "primary", 300),
+        ("7d", "secondary", 10_080),
+    ):
+        raw = bucket.get(field)
+        if not isinstance(raw, dict):
+            continue
+        used_raw = raw.get("usedPercent")
+        reset_raw = raw.get("resetsAt")
+        duration_raw = raw.get("windowDurationMins")
+        if isinstance(used_raw, bool) or not isinstance(used_raw, (int, float)):
+            continue
+        used = float(used_raw)
+        if not math.isfinite(used):
+            continue
+        remaining = max(0.0, min(100.0, 100.0 - used))
+        resets_at = (
+            int(reset_raw)
+            if isinstance(reset_raw, (int, float))
+            and not isinstance(reset_raw, bool)
+            and math.isfinite(float(reset_raw))
+            and float(reset_raw) > 0
+            else 0
+        )
+        duration = (
+            int(duration_raw)
+            if isinstance(duration_raw, (int, float))
+            and not isinstance(duration_raw, bool)
+            else expected_minutes
+        )
+        windows[key] = {
+            "remaining_percent": remaining,
+            "resets_at": resets_at,
+            "window_duration_mins": duration,
+        }
+    if not windows:
+        raise ValueError("Codex rate limit windows are unavailable")
+    return windows
+
+
+def format_quota_percent(value: float) -> str:
+    rounded = round(max(0.0, min(100.0, float(value))), 1)
+    return str(int(rounded)) if rounded.is_integer() else f"{rounded:.1f}"
+
+
+def format_quota_reset(resets_at: int) -> str:
+    if resets_at <= 0:
+        return "刷新时间未知"
+    try:
+        local = datetime.fromtimestamp(resets_at).astimezone()
+    except (OSError, OverflowError, ValueError):
+        return "刷新时间未知"
+    return f"{local.month}月{local.day}日{local.hour:02d}:{local.minute:02d}刷新"
+
+
+def format_quota_lines(windows: dict[str, dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for key in ("5h", "7d"):
+        window = windows.get(key)
+        if not isinstance(window, dict):
+            lines.append(f"{key}额度：暂时无法读取")
+            continue
+        remaining = format_quota_percent(float(window["remaining_percent"]))
+        reset = format_quota_reset(int(window.get("resets_at") or 0))
+        lines.append(f"{key}额度：{remaining}%，{reset}")
+    return "\n".join(lines)
+
+
+def format_cached_quota_status(
+    config: dict[str, Any], state: dict[str, Any], now: float | None = None
+) -> str:
+    snapshot = state.get("quota_status")
+    if not isinstance(snapshot, dict):
+        return "Codex额度：暂时无法读取"
+    updated_at = snapshot.get("updated_at")
+    windows = snapshot.get("windows")
+    current = time.time() if now is None else now
+    stale_seconds = float(config.get("quota_cache_stale_seconds", 180))
+    if (
+        not isinstance(updated_at, (int, float))
+        or current - float(updated_at) > stale_seconds
+        or not isinstance(windows, dict)
+    ):
+        return "Codex额度：暂时无法读取"
+    return format_quota_lines(windows)
+
+
+def quota_alert_stage(remaining_percent: float, warning_percent: float) -> str:
+    if remaining_percent <= 0:
+        return "empty"
+    if remaining_percent <= warning_percent:
+        return "low"
+    return "normal"
+
+
+def plan_quota_alerts(
+    state: dict[str, Any],
+    windows: dict[str, dict[str, Any]],
+    warning_percent: float,
+) -> dict[str, str]:
+    """Re-arm recovered windows and return threshold transitions needing delivery."""
+    stages = state.setdefault("quota_alert_stages", {})
+    planned: dict[str, str] = {}
+    for key in ("5h", "7d"):
+        window = windows.get(key)
+        if not isinstance(window, dict):
+            continue
+        current = quota_alert_stage(
+            float(window["remaining_percent"]), warning_percent
+        )
+        previous = str(stages.get(key) or "normal")
+        if current == "normal":
+            stages[key] = "normal"
+        elif current == "low" and previous == "normal":
+            planned[key] = current
+        elif current == "empty" and previous != "empty":
+            planned[key] = current
+    return planned
+
+
 def format_pinned_task_status(
     config: dict[str, Any],
     state: dict[str, Any],
@@ -701,8 +855,12 @@ def format_pinned_task_status(
         f"置顶文件夹任务回复推送：{'已开启' if project_push else '已关闭'}"
         + (f"（当前 {project_count} 个对话）" if project_push else "")
     )
+    quota_lines = format_cached_quota_status(config, state)
     if not pinned:
-        return f"{pinned_line}\n{project_line}\n\n当前没有单独置顶任务。"
+        return (
+            f"{quota_lines}\n{WECHAT_BLANK_LINE}\n{pinned_line}\n{project_line}"
+            f"\n{WECHAT_BLANK_LINE}\n当前没有单独置顶任务。"
+        )
     active_sessions = active_sessions or {}
     now = time.time()
     automation_runtimes: dict[str, dict[str, Any]] = {}
@@ -716,7 +874,14 @@ def format_pinned_task_status(
             current.get("started_at") or now
         ):
             automation_runtimes[target_id] = runtime
-    lines = [pinned_line, project_line, "", f"置顶任务（{len(pinned)}）"]
+    lines = [
+        quota_lines,
+        WECHAT_BLANK_LINE,
+        pinned_line,
+        project_line,
+        WECHAT_BLANK_LINE,
+        f"置顶任务（{len(pinned)}）",
+    ]
     for index, thread in enumerate(pinned, 1):
         thread_id = str(thread["id"])
         session = active_sessions.get(thread_id)
@@ -1230,6 +1395,137 @@ class AppServerClient:
             return "Codex app-server WebSocket connection closed"
         exit_code = self.process.poll() if self.process is not None else None
         return f"Codex app-server exited with code {exit_code}"
+
+
+class CodexQuotaMonitor:
+    """Keep one authenticated app-server connection for inexpensive quota polling."""
+
+    def __init__(self, config: dict[str, Any]):
+        self.config = config
+        self.client: AppServerClient | None = None
+
+    def _connect(self) -> AppServerClient:
+        client = AppServerClient(
+            str(self.config["codex_cli"]),
+            float(self.config["codex_app_server_request_timeout_seconds"]),
+            float(self.config["codex_app_server_request_timeout_seconds"]),
+            (
+                str(self.config["codex_app_server_ws_url"])
+                if self.config["codex_app_server_transport"]
+                == "desktop-shared-websocket"
+                else None
+            ),
+        )
+        try:
+            client.request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "cc-connect-codex-quota-monitor",
+                        "title": "WeChat Codex Quota Monitor",
+                        "version": NOTIFIER_VERSION,
+                    }
+                },
+            )
+            client.send({"method": "initialized", "params": {}})
+        except Exception:
+            client.close()
+            raise
+        self.client = client
+        return client
+
+    def read(self) -> dict[str, dict[str, Any]]:
+        client = self.client or self._connect()
+        try:
+            return normalize_quota_limits(
+                client.request("account/rateLimits/read", {})
+            )
+        except (OSError, RuntimeError, TimeoutError, ValueError):
+            self.close()
+            raise
+
+    def consume_rate_limit_update(self) -> bool:
+        """Drain server notifications and report whether quota changed."""
+        client = self.client
+        if client is None:
+            return False
+        changed = False
+        connection_closed = False
+        while True:
+            try:
+                message = client.notifications.get_nowait()
+            except queue.Empty:
+                break
+            if message is None:
+                connection_closed = True
+                continue
+            if message.get("method") == "account/rateLimits/updated":
+                changed = True
+        if connection_closed:
+            self.close()
+        return changed
+
+    def close(self) -> None:
+        client = self.client
+        self.client = None
+        if client is not None:
+            client.close()
+
+
+def refresh_quota_status(
+    config: dict[str, Any],
+    state: dict[str, Any],
+    state_path: Path,
+    state_lock: threading.RLock,
+    monitor: CodexQuotaMonitor,
+    logger: logging.Logger,
+) -> bool:
+    """Refresh the cached quota and deliver any newly crossed threshold once."""
+    try:
+        windows = monitor.read()
+    except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
+        logger.warning("Codex quota refresh failed error=%s", str(exc)[-500:])
+        return False
+
+    warning_percent = float(config.get("quota_warning_percent", 10))
+    with state_lock:
+        state["quota_status"] = {
+            "updated_at": int(time.time()),
+            "windows": windows,
+        }
+        planned = plan_quota_alerts(state, windows, warning_percent)
+        session_key = str(state.get("wechat_session_key") or "")
+        save_state(state_path, state)
+
+    if not planned:
+        return True
+    if not session_key:
+        logger.info(
+            "Codex quota alert deferred because no WeChat session is known thresholds=%s",
+            ",".join(sorted(planned)),
+        )
+        return True
+
+    message = format_quota_lines(windows)
+    ok, detail = send_via_cc_connect(config, message, session_key)
+    if not ok:
+        logger.warning(
+            "Codex quota alert delivery failed thresholds=%s error=%s",
+            ",".join(sorted(planned)),
+            detail[-500:],
+        )
+        return False
+
+    with state_lock:
+        stages = state.setdefault("quota_alert_stages", {})
+        for key, stage in planned.items():
+            stages[key] = stage
+        save_state(state_path, state)
+    logger.info(
+        "Codex quota alert delivered thresholds=%s",
+        ",".join(f"{key}:{stage}" for key, stage in sorted(planned.items())),
+    )
+    return True
 
 
 def run_codex_reply(
@@ -2188,6 +2484,7 @@ def toggle_pinned_project_push(
 
 
 def health_status(config: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    quota_status = state.get("quota_status")
     return {
         "ok": True,
         "version": NOTIFIER_VERSION,
@@ -2198,6 +2495,10 @@ def health_status(config: dict[str, Any], state: dict[str, Any]) -> dict[str, An
             state.get("pinned_project_push_enabled", False)
         ),
         "submit_transport": str(config.get("codex_submit_transport") or ""),
+        "quota_monitor_enabled": bool(config.get("quota_monitor_enabled", True)),
+        "quota_cache_updated_at": (
+            quota_status.get("updated_at") if isinstance(quota_status, dict) else None
+        ),
     }
 
 
@@ -2884,6 +3185,7 @@ def acquire_lock(path: Path):
 
 def status(config: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     threads = read_desktop_threads(config)
+    quota_status = state.get("quota_status")
     return {
         "initialized": bool(state.get("initialized")),
         "eligible_desktop_threads": len(threads),
@@ -2904,6 +3206,11 @@ def status(config: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
         "pinned_project_reply_push_enabled": bool(
             state.get("pinned_project_push_enabled", False)
         ),
+        "quota_monitor_enabled": bool(config.get("quota_monitor_enabled", True)),
+        "quota_cache_updated_at": (
+            quota_status.get("updated_at") if isinstance(quota_status, dict) else None
+        ),
+        "quota_alert_stages": dict(state.get("quota_alert_stages") or {}),
     }
 
 
@@ -2938,6 +3245,8 @@ def run(args: argparse.Namespace) -> int:
 
     router: ThreadingHTTPServer | None = None
     shared_app_server: SharedAppServerProcess | None = None
+    quota_monitor: CodexQuotaMonitor | None = None
+    next_quota_poll_at = 0.0
     try:
         if config["codex_app_server_transport"] == "desktop-shared-websocket":
             shared_app_server = SharedAppServerProcess(
@@ -2950,6 +3259,8 @@ def run(args: argparse.Namespace) -> int:
                 "Shared Codex app-server ready url=%s",
                 config["codex_app_server_ws_url"],
             )
+        if bool(config.get("quota_monitor_enabled", True)):
+            quota_monitor = CodexQuotaMonitor(config)
         router = start_quote_router(
             config,
             state,
@@ -2966,8 +3277,6 @@ def run(args: argparse.Namespace) -> int:
                 state["automation_runs_initialized"] = True
                 save_state(state_path, state)
             logger.info("Initial baseline complete threads=%s", len(threads))
-            if args.once:
-                return 0
 
         logger.info("Notifier started poll_seconds=%s", config["poll_seconds"])
         while True:
@@ -2976,6 +3285,26 @@ def run(args: argparse.Namespace) -> int:
                     logger.warning(
                         "Shared Codex app-server restarted url=%s",
                         config["codex_app_server_ws_url"],
+                    )
+                    if quota_monitor is not None:
+                        quota_monitor.close()
+                        next_quota_poll_at = 0.0
+                if (
+                    quota_monitor is not None
+                    and quota_monitor.consume_rate_limit_update()
+                ):
+                    next_quota_poll_at = 0.0
+                if quota_monitor is not None and time.monotonic() >= next_quota_poll_at:
+                    refresh_quota_status(
+                        config,
+                        state,
+                        state_path,
+                        state_lock,
+                        quota_monitor,
+                        logger,
+                    )
+                    next_quota_poll_at = time.monotonic() + max(
+                        15.0, float(config.get("quota_poll_seconds", 60))
                     )
                 with state_lock:
                     poll_threads(config, state, logger)
@@ -3010,6 +3339,8 @@ def run(args: argparse.Namespace) -> int:
         if router is not None:
             router.shutdown()
             router.server_close()
+        if quota_monitor is not None:
+            quota_monitor.close()
         if shared_app_server is not None:
             shared_app_server.close()
         lock_handle.close()

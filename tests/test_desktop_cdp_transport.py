@@ -58,6 +58,52 @@ class DesktopCdpTransportTests(unittest.TestCase):
         )
         self.assertTrue(target["webSocketDebuggerUrl"].endswith("/c"))
 
+    def test_discovers_codex_cdp_when_configured_port_changes(self):
+        client = DesktopCdpClient("http://127.0.0.1:9335")
+        codex_targets = [
+            {
+                "type": "page",
+                "url": "app://-/index.html?initialRoute=%2Flocal%2Fthread-1",
+                "webSocketDebuggerUrl": (
+                    "ws://127.0.0.1:9354/devtools/page/codex"
+                ),
+            }
+        ]
+
+        def fetch(port, _timeout):
+            if port == 9354:
+                return codex_targets
+            raise RuntimeError("unavailable")
+
+        with mock.patch.object(client, "_fetch_targets", side_effect=fetch) as fetch_targets:
+            self.assertEqual(client.list_targets(), codex_targets)
+        self.assertEqual(client.port, 9354)
+        self.assertEqual(fetch_targets.call_args_list[0].args[0], 9335)
+
+    def test_cdp_discovery_rejects_non_codex_debug_targets(self):
+        client = DesktopCdpClient("http://127.0.0.1:9335")
+        browser_targets = [
+            {
+                "type": "page",
+                "url": "https://example.com",
+                "webSocketDebuggerUrl": (
+                    "ws://127.0.0.1:9336/devtools/page/browser"
+                ),
+            }
+        ]
+
+        def fetch(port, _timeout):
+            if port == 9335:
+                raise RuntimeError("configured port unavailable")
+            if port == 9336:
+                return browser_targets
+            raise RuntimeError("unavailable")
+
+        with mock.patch.object(client, "_fetch_targets", side_effect=fetch):
+            with self.assertRaisesRegex(RuntimeError, "configured port unavailable"):
+                client.list_targets()
+        self.assertEqual(client.port, 9335)
+
     def test_expression_uses_json_payload_without_string_injection(self):
         expression = build_follow_up_expression(
             "thread-1",

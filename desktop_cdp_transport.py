@@ -457,9 +457,9 @@ class DesktopCdpClient:
         self.host, self.port = validate_loopback_http_url(base_url)
         self.timeout_seconds = timeout_seconds
 
-    def list_targets(self) -> list[dict[str, Any]]:
+    def _fetch_targets(self, port: int, timeout_seconds: float) -> list[dict[str, Any]]:
         connection = http.client.HTTPConnection(
-            self.host, self.port, timeout=self.timeout_seconds
+            self.host, port, timeout=timeout_seconds
         )
         try:
             connection.request("GET", "/json/list")
@@ -480,6 +480,28 @@ class DesktopCdpClient:
         if not isinstance(targets, list):
             raise RuntimeError("Codex Desktop CDP returned an invalid target list")
         return [target for target in targets if isinstance(target, dict)]
+
+    def list_targets(self) -> list[dict[str, Any]]:
+        configured_error: RuntimeError | None = None
+        try:
+            targets = self._fetch_targets(self.port, self.timeout_seconds)
+            select_primary_codex_target(targets)
+            return targets
+        except RuntimeError as exc:
+            configured_error = exc
+
+        discovery_timeout = min(self.timeout_seconds, 0.5)
+        for port in range(9335, 9355):
+            if port == self.port:
+                continue
+            try:
+                targets = self._fetch_targets(port, discovery_timeout)
+                select_primary_codex_target(targets)
+            except RuntimeError:
+                continue
+            self.port = port
+            return targets
+        raise configured_error
 
     def evaluate(self, expression: str) -> dict[str, Any]:
         target = select_primary_codex_target(self.list_targets())

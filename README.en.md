@@ -24,7 +24,8 @@ fork branch, and every bundle records the pinned source commit.
 - Recognizes individually pinned Codex automations, pushes new scheduled run
   results, and routes quoted replies to the automation's target task.
 - `/rwfolder` optionally includes every task inside pinned Desktop projects.
-- `/rw` lists pinned tasks in current sidebar order and runtime status.
+- `/rw` shows remaining 5-hour and 7-day quota with reset times, then lists pinned tasks in current sidebar order and runtime status.
+- A Weixin alert is sent once when either quota first falls to 10% or below, and once more if it reaches 0%; alerts re-arm after recovery.
 - `/rw3 内容` routes to pinned task 3; `/rw3 /y 内容` submits directly.
 - Quoted normal replies queue while a task is active.
 - Ordinary queued replies are written to Codex Desktop's native queue above
@@ -103,19 +104,21 @@ notifier, local router, and Weixin response path are connected.
    to operate from Weixin.
 2. Make sure both `cc-connect` and this notifier are running. Use
    `notifier.py --selftest` to validate configuration and the loopback router.
-3. Send `/rw` in Weixin. The notifier lists pinned tasks in the current Codex
-   Desktop sidebar order, including task number, runtime status, and elapsed
-   time.
+3. Send `/rw` in Weixin. The notifier first shows the remaining 5-hour and
+   7-day Codex quota and reset times, then lists pinned tasks in the current
+   Codex Desktop sidebar order, including task number, runtime status, and
+   elapsed time.
 4. Use the displayed number with `/rw<number> content` to send a new message
    to a specific pinned task.
 
 ### Check task status
 
-`/rw` shows every currently pinned task, including individually pinned
-   automations. A running task shows its processing
+`/rw` shows the remaining 5-hour and 7-day quota and every currently pinned
+   task, including individually pinned automations. A running task shows its processing
    time; an idle task shows `空闲`. If no tasks are pinned, the response says so.
    Numbers follow the current pinned order and can change when tasks are
-   unpinned or archived.
+   unpinned or archived. If quota reading is temporarily unavailable, task
+   status is still returned normally.
 
 ### Reply to a final answer
 
@@ -183,6 +186,19 @@ scheduled run history is baselined and is not replayed. Codex may create and
 archive a separate execution task for each scheduled run; its new final answer
 is associated with the pinned automation target so quoting the notification or
 using `/rw<number> content` continues the target task.
+
+### Quota alerts
+
+When either the 5-hour or 7-day remaining quota first falls from above 10% to
+10% or below, the notifier sends one Weixin alert. If that quota later reaches
+0%, it sends one more alert. Each message includes both current percentages and
+their local reset times. Repeated polls and notifier restarts do not duplicate
+an alert in the same state; recovery above 10% re-arms the next warning.
+
+Quota alerts are independent of `/rwpush` and `/rwfolder`. They use a persistent
+local Codex App Server connection and poll every 60 seconds by default. Failed
+Weixin delivery is retried on a later poll and is not marked as delivered. Only
+percentages, reset times, and alert stages are persisted—never account tokens.
 
 When a quoted reply is sent to a final answer, ordinary text queues if the task
 is processing. Prefix new content with `/y` for direct submission. Queue

@@ -103,6 +103,9 @@ codex_quote_router_token = "test-secret-token"
             path.write_text(json.dumps(config), encoding="utf-8")
             loaded = notifier.load_config(path)
             self.assertEqual(loaded["codex_submit_transport"], "desktop-cdp")
+            self.assertTrue(loaded["quota_monitor_enabled"])
+            self.assertEqual(loaded["quota_poll_seconds"], 60)
+            self.assertEqual(loaded["quota_warning_percent"], 10)
 
     def test_desktop_submit_uses_target_thread_model_preferences(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -724,8 +727,9 @@ codex_quote_router_token = "test-secret-token"
                 message = notifier.format_pinned_task_status(config, state)
             self.assertTrue(
                 message.startswith(
+                    "Codex额度：暂时无法读取\n\u200b\n"
                     "置顶任务回复推送：已开启\n"
-                    "置顶文件夹任务回复推送：已关闭\n\n"
+                    "置顶文件夹任务回复推送：已关闭\n\u200b\n"
                     "置顶任务（1）\n"
                 )
             )
@@ -739,6 +743,209 @@ codex_quote_router_token = "test-secret-token"
             message = notifier.format_pinned_task_status(config, state)
             self.assertIn("置顶任务回复推送：已关闭", message)
             self.assertIn("置顶文件夹任务回复推送：已开启", message)
+
+    def test_quota_limits_are_normalized_without_account_data(self):
+        windows = notifier.normalize_quota_limits(
+            {
+                "rateLimits": {
+                    "primary": {
+                        "usedPercent": 91,
+                        "windowDurationMins": 300,
+                        "resetsAt": 1_800_000_000,
+                    },
+                    "secondary": {
+                        "usedPercent": 100,
+                        "windowDurationMins": 10_080,
+                        "resetsAt": 1_800_100_000,
+                    },
+                    "planType": "pro",
+                }
+            }
+        )
+        self.assertEqual(windows["5h"]["remaining_percent"], 9)
+        self.assertEqual(windows["7d"]["remaining_percent"], 0)
+        self.assertNotIn("planType", json.dumps(windows))
+
+    def test_rw_status_includes_cached_quota_before_push_settings(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, config = self.make_fixture(root)
+            config["quota_cache_stale_seconds"] = 10**12
+            state = notifier.empty_state()
+            state["quota_status"] = {
+                "updated_at": 1000,
+                "windows": {
+                    "5h": {"remaining_percent": 9, "resets_at": 1},
+                    "7d": {"remaining_percent": 53, "resets_at": 2},
+                },
+            }
+            with mock.patch.object(
+                notifier, "format_quota_reset", side_effect=["8月29日23:30刷新", "9月4日10:14刷新"]
+            ):
+                message = notifier.format_pinned_task_status(config, state)
+            self.assertTrue(
+                message.startswith(
+                    "5h额度：9%，8月29日23:30刷新\n"
+                    "7d额度：53%，9月4日10:14刷新\n\u200b\n"
+                    "置顶任务回复推送：已开启"
+                )
+            )
+            self.assertIn(
+                "置顶文件夹任务回复推送：已关闭\n\u200b\n置顶任务（1）",
+                message,
+            )
+
+    def test_stale_quota_cache_does_not_block_rw_task_status(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, config = self.make_fixture(root)
+            config["quota_cache_stale_seconds"] = 60
+            state = notifier.empty_state()
+            state["quota_status"] = {"updated_at": 1, "windows": {}}
+            message = notifier.format_pinned_task_status(config, state)
+            self.assertIn("Codex额度：暂时无法读取", message)
+            self.assertIn("置顶任务（1）", message)
+
+    def test_quota_alert_state_machine_warns_low_then_empty_and_rearms(self):
+        state = notifier.empty_state()
+        low = {
+            "5h": {"remaining_percent": 9},
+            "7d": {"remaining_percent": 50},
+        }
+        self.assertEqual(notifier.plan_quota_alerts(state, low, 10), {"5h": "low"})
+        state["quota_alert_stages"]["5h"] = "low"
+        self.assertEqual(notifier.plan_quota_alerts(state, low, 10), {})
+
+        empty = {
+            "5h": {"remaining_percent": 0},
+            "7d": {"remaining_percent": 50},
+        }
+        self.assertEqual(
+            notifier.plan_quota_alerts(state, empty, 10), {"5h": "empty"}
+        )
+        state["quota_alert_stages"]["5h"] = "empty"
+        recovered = {
+            "5h": {"remaining_percent": 99},
+            "7d": {"remaining_percent": 50},
+        }
+        self.assertEqual(notifier.plan_quota_alerts(state, recovered, 10), {})
+        self.assertEqual(state["quota_alert_stages"]["5h"], "normal")
+        self.assertEqual(notifier.plan_quota_alerts(state, low, 10), {"5h": "low"})
+
+        direct_empty_state = notifier.empty_state()
+        self.assertEqual(
+            notifier.plan_quota_alerts(direct_empty_state, empty, 10),
+            {"5h": "empty"},
+        )
+
+    def test_quota_alert_is_marked_only_after_successful_wechat_delivery(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_path = Path(temp) / "state.json"
+            state = notifier.empty_state()
+            state["wechat_session_key"] = "weixin:dm:u1"
+            monitor = mock.MagicMock()
+            monitor.read.return_value = {
+                "5h": {"remaining_percent": 9, "resets_at": 1_800_000_000},
+                "7d": {"remaining_percent": 50, "resets_at": 1_800_100_000},
+            }
+            config = {"quota_warning_percent": 10}
+            logger = notifier.logging.getLogger("test-quota-alert")
+            with mock.patch.object(
+                notifier, "send_via_cc_connect", return_value=(False, "offline")
+            ) as send:
+                self.assertFalse(
+                    notifier.refresh_quota_status(
+                        config,
+                        state,
+                        state_path,
+                        threading.RLock(),
+                        monitor,
+                        logger,
+                    )
+                )
+            self.assertNotIn("5h", state["quota_alert_stages"])
+            send.assert_called_once()
+
+            with mock.patch.object(
+                notifier, "send_via_cc_connect", return_value=(True, "ok")
+            ) as send:
+                self.assertTrue(
+                    notifier.refresh_quota_status(
+                        config,
+                        state,
+                        state_path,
+                        threading.RLock(),
+                        monitor,
+                        logger,
+                    )
+                )
+            self.assertEqual(state["quota_alert_stages"]["5h"], "low")
+            self.assertIn("5h额度：9%", send.call_args.args[1])
+            self.assertIn("7d额度：50%", send.call_args.args[1])
+            self.assertEqual(send.call_args.args[2], "weixin:dm:u1")
+
+    def test_quota_alert_without_wechat_session_remains_pending(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_path = Path(temp) / "state.json"
+            state = notifier.empty_state()
+            monitor = mock.MagicMock()
+            monitor.read.return_value = {
+                "5h": {"remaining_percent": 100, "resets_at": 1_800_000_000},
+                "7d": {"remaining_percent": 0, "resets_at": 1_800_100_000},
+            }
+            with mock.patch.object(notifier, "send_via_cc_connect") as send:
+                self.assertTrue(
+                    notifier.refresh_quota_status(
+                        {"quota_warning_percent": 10},
+                        state,
+                        state_path,
+                        threading.RLock(),
+                        monitor,
+                        notifier.logging.getLogger("test-quota-no-session"),
+                    )
+                )
+            send.assert_not_called()
+            self.assertNotIn("7d", state["quota_alert_stages"])
+
+    def test_quota_monitor_consumes_rate_limit_update_events(self):
+        monitor = notifier.CodexQuotaMonitor({})
+        client = mock.MagicMock()
+        client.notifications = notifier.queue.Queue()
+        client.notifications.put({"method": "account/updated", "params": {}})
+        client.notifications.put(
+            {"method": "account/rateLimits/updated", "params": {}}
+        )
+        monitor.client = client
+        self.assertTrue(monitor.consume_rate_limit_update())
+        self.assertFalse(monitor.consume_rate_limit_update())
+
+    def test_delivered_quota_alert_survives_state_reload_without_duplication(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_path = Path(temp) / "state.json"
+            state = notifier.empty_state()
+            state["wechat_session_key"] = "weixin:dm:u1"
+            monitor = mock.MagicMock()
+            monitor.read.return_value = {
+                "5h": {"remaining_percent": 10, "resets_at": 1_800_000_000},
+                "7d": {"remaining_percent": 80, "resets_at": 1_800_100_000},
+            }
+            config = {"quota_warning_percent": 10}
+            lock = threading.RLock()
+            logger = notifier.logging.getLogger("test-quota-persistence")
+            with mock.patch.object(
+                notifier, "send_via_cc_connect", return_value=(True, "ok")
+            ):
+                notifier.refresh_quota_status(
+                    config, state, state_path, lock, monitor, logger
+                )
+
+            reloaded = notifier.load_state(state_path)
+            with mock.patch.object(notifier, "send_via_cc_connect") as send:
+                notifier.refresh_quota_status(
+                    config, reloaded, state_path, lock, monitor, logger
+                )
+            send.assert_not_called()
+            self.assertEqual(reloaded["quota_alert_stages"]["5h"], "low")
 
     def test_quote_route_matches_without_storing_answer(self):
         state = notifier.empty_state()

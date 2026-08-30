@@ -187,11 +187,51 @@ archive a separate execution task for each scheduled run; its new final answer
 is associated with the pinned automation target so quoting the notification or
 using `/rw<number> content` continues the target task.
 
-If Weixin's temporary `context_token` expires, the notifier suspends individual
-delivery and records newly completed replies as a backlog. After the user sends
-the bot another message and the token is refreshed, Weixin receives one backlog
-summary grouped by task title, such as `【Research】2 messages`. The summary never
-contains answer text; complete answers remain available in their Codex tasks.
+### Weixin `context_token` expiry and backlog summaries
+
+`context_token` is a temporary reply credential issued by the Weixin gateway
+with an inbound user message. cc-connect must include it when proactively sending
+a completed Codex answer to that Weixin conversation. It is not a Weixin login
+credential, a Codex API key, or a Codex usage-limit token, and its expiry does not
+stop the underlying Codex task.
+
+When the user messages the bot, the gateway may issue a fresh `context_token`,
+which cc-connect caches for later notifications. Persisting the token only lets
+cc-connect reload it after a restart; it does not extend server-side validity.
+The gateway does not publish a fixed lifetime. Inactivity, login or conversation
+changes, gateway rotation, and risk controls may all invalidate an older token,
+so a fixed periodic refresh cannot reliably prevent expiry.
+
+Typical symptoms are a completed Codex task with no Weixin notification and a
+cc-connect or notifier log containing `ret=-2`, `expired context_token`, or an
+instruction that the user must message the bot again. This is a Weixin delivery
+authorization failure, not a failed Codex task or exhausted Codex quota.
+
+The notifier handles this condition as follows:
+
+1. It stops sending individual answers so a later token refresh cannot cause a
+   flood of old messages.
+2. Replies completed during the outage remain recorded as a backlog, while their
+   complete answer text stays in the original Codex tasks.
+3. The backlog is counted by task title; no answer text is copied into the summary.
+4. After the user sends the bot any new Weixin message, the gateway normally
+   issues a fresh credential and the notifier immediately attempts one backlog
+   summary. Delivery records are cleared only after that summary succeeds; if
+   the gateway still rejects the credential, the backlog remains for a later retry.
+
+Example:
+
+```text
+积压消息汇总
+
+【Research】2 messages
+【Daily】1 message
+```
+
+The summary means the answers are available in Codex; it does not mean they were
+lost. Open the corresponding Codex task to read them, or use `/rw<number> content`
+to continue a specific task from Weixin. Because one summary can cover multiple
+tasks, quoting the summary cannot route a reply to one specific task.
 
 ### Quota alerts
 

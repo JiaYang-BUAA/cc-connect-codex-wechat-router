@@ -29,7 +29,7 @@ from websocket_transport import SharedAppServerProcess, WebSocketConnection
 
 
 STATE_VERSION = 2
-NOTIFIER_VERSION = "1.2.1"
+NOTIFIER_VERSION = "1.3.0"
 QUOTE_FOOTER = "↩ 引用此条信息进行回复"
 QUEUE_HINT = "如任务正在处理，则默认排队，直接提交请加前缀“/y”"
 WECHAT_BLANK_LINE = "\u200b"

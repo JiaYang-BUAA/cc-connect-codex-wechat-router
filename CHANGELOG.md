@@ -5,10 +5,23 @@ Python notifier unless a cc-connect routing patch is named explicitly.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-08-30
+
+- Added cached 5-hour and 7-day Codex quota status to `/rw`, including local
+  reset times, and proactive Weixin alerts when either window first reaches 10%
+  remaining and again at 0%.
+- Added event-driven quota refresh with a 60-second fallback poll, persistent
+  alert stages, and mobile-safe spacing for quota and task-status messages.
+- Added safe Codex Desktop CDP discovery across local ports 9335-9354 when the
+  configured debug port changes, while rejecting unrelated Chromium targets.
+- Corrected `/rw` so the pinned-task and pinned-folder push switches are reported
+  independently instead of both appearing disabled.
 - Replaced delayed per-answer replay after a Weixin `context_token` expiry with
   one privacy-preserving backlog summary grouped by Codex task title and count.
 - Wake backlog-summary delivery as soon as a new inbound Weixin request refreshes
   the reply context, while retaining bounded retries for other inbound messages.
+- Expanded the Chinese and English guides to explain `context_token` purpose,
+  expiry symptoms, recovery, and the backlog-summary behavior.
 
 ## [1.2.1] - 2026-08-19
 
@@ -54,7 +67,8 @@ Python notifier unless a cc-connect routing patch is named explicitly.
   installation.
 - Added the cc-connect `v1.4.1+qr3` routing companion.
 
-[Unreleased]: https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/releases/tag/v1.3.0
 [1.2.1]: https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/releases/tag/v1.2.1
 [1.2.0]: https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/releases/tag/v1.2.0
 [1.1.0]: https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/releases/tag/v1.1.0

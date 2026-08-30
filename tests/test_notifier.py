@@ -1056,6 +1056,117 @@ codex_quote_router_token = "test-secret-token"
             loaded = notifier.load_state(path)
             self.assertEqual(loaded["pending"][0]["delivery_status"], "queued")
 
+    def test_pending_summary_groups_titles_without_answer_content(self):
+        message = notifier.format_pending_summary(
+            [
+                {"title": "科研", "answer": "第一条敏感内容"},
+                {"title": "日常", "answer": "第二条敏感内容"},
+                {"title": "科研", "answer": "第三条敏感内容"},
+            ]
+        )
+        self.assertEqual(
+            message,
+            "积压消息汇总\n\u200b\n【科研】2条\n【日常】1条",
+        )
+        self.assertNotIn("敏感内容", message)
+
+    def test_expired_wechat_context_switches_delivery_to_summary_mode(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_path = Path(temp) / "state.json"
+            state = notifier.empty_state()
+            state["wechat_session_key"] = "weixin:dm:u1"
+            state["pending"] = [
+                {
+                    "thread_id": "thread-1",
+                    "turn_id": "turn-1",
+                    "title": "科研",
+                    "answer": "答复一",
+                    "next_chunk": 0,
+                    "attempts": 0,
+                    "next_retry_at": 0,
+                    "delivery_status": "queued",
+                },
+                {
+                    "thread_id": "thread-2",
+                    "turn_id": "turn-2",
+                    "title": "日常",
+                    "answer": "答复二",
+                    "next_chunk": 0,
+                    "attempts": 0,
+                    "next_retry_at": 0,
+                    "delivery_status": "queued",
+                },
+            ]
+            config = {
+                "max_message_chars": 3400,
+                "quote_route_history_limit": 20,
+                "sent_history_limit": 20,
+            }
+            detail = "sendMessage ret=-2 (expired context_token)"
+            with mock.patch.object(
+                notifier, "send_via_cc_connect", return_value=(False, detail)
+            ) as send:
+                delivered = notifier.deliver_pending(
+                    config,
+                    state,
+                    state_path,
+                    threading.RLock(),
+                    notifier.logging.getLogger("test-expired-summary-mode"),
+                )
+            self.assertEqual(delivered, 0)
+            self.assertEqual(send.call_count, 1)
+            self.assertTrue(state["pending_summary"]["active"])
+            self.assertEqual(len(state["pending"]), 2)
+            self.assertEqual(state["pending"][0]["delivery_status"], "queued")
+
+    def test_pending_summary_sends_once_and_clears_grouped_items(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_path = Path(temp) / "state.json"
+            state = notifier.empty_state()
+            state["wechat_session_key"] = "weixin:dm:u1"
+            state["pending_summary"] = {
+                "active": True,
+                "attempts": 2,
+                "next_retry_at": 0,
+            }
+            state["pending"] = [
+                {"thread_id": "t1", "turn_id": "a", "title": "科研", "answer": "A"},
+                {"thread_id": "t1", "turn_id": "b", "title": "科研", "answer": "B"},
+                {"thread_id": "t2", "turn_id": "c", "title": "日常", "answer": "C"},
+            ]
+            config = {"sent_history_limit": 20}
+            with mock.patch.object(
+                notifier, "send_via_cc_connect", return_value=(True, "ok")
+            ) as send:
+                delivered = notifier.deliver_pending(
+                    config,
+                    state,
+                    state_path,
+                    threading.RLock(),
+                    notifier.logging.getLogger("test-send-summary"),
+                )
+            self.assertEqual(delivered, 3)
+            send.assert_called_once()
+            message = send.call_args.args[1]
+            self.assertEqual(message, "积压消息汇总\n\u200b\n【科研】2条\n【日常】1条")
+            self.assertNotIn("A", message)
+            self.assertEqual(state["pending"], [])
+            self.assertEqual(state["pending_summary"], {})
+            self.assertEqual(set(state["sent_turns"]), {"a", "b", "c"})
+
+    def test_inbound_wechat_message_wakes_pending_summary_retry(self):
+        state = notifier.empty_state()
+        state["wechat_session_key"] = "weixin:dm:u1"
+        state["pending_summary"] = {
+            "active": True,
+            "attempts": 4,
+            "next_retry_at": 9999999999,
+        }
+        changed = notifier.remember_wechat_session(state, {"user_id": "u1"})
+        self.assertTrue(changed)
+        self.assertEqual(state["pending_summary"]["attempts"], 0)
+        self.assertEqual(state["pending_summary"]["next_retry_at"], 0)
+
     def test_deliver_pending_releases_state_lock_while_sending(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

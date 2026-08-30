@@ -187,6 +187,12 @@ archive a separate execution task for each scheduled run; its new final answer
 is associated with the pinned automation target so quoting the notification or
 using `/rw<number> content` continues the target task.
 
+If Weixin's temporary `context_token` expires, the notifier suspends individual
+delivery and records newly completed replies as a backlog. After the user sends
+the bot another message and the token is refreshed, Weixin receives one backlog
+summary grouped by task title, such as `【Research】2 messages`. The summary never
+contains answer text; complete answers remain available in their Codex tasks.
+
 ### Quota alerts
 
 When either the 5-hour or 7-day remaining quota first falls from above 10% to

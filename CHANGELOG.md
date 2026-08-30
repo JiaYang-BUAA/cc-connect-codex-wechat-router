@@ -5,6 +5,11 @@ Python notifier unless a cc-connect routing patch is named explicitly.
 
 ## [Unreleased]
 
+- Replaced delayed per-answer replay after a Weixin `context_token` expiry with
+  one privacy-preserving backlog summary grouped by Codex task title and count.
+- Wake backlog-summary delivery as soon as a new inbound Weixin request refreshes
+  the reply context, while retaining bounded retries for other inbound messages.
+
 ## [1.2.1] - 2026-08-19
 
 - Restored Codex Desktop submission after Desktop added an `initialRoute` query

@@ -148,6 +148,7 @@ def empty_state() -> dict[str, Any]:
         "automation_runs_initialized": False,
         "quota_status": {},
         "quota_alert_stages": {},
+        "pending_summary": {},
     }
 
 
@@ -181,6 +182,9 @@ def load_state(path: Path) -> dict[str, Any]:
     state.setdefault("automation_runs_initialized", False)
     state.setdefault("quota_status", {})
     state.setdefault("quota_alert_stages", {})
+    pending_summary = state.setdefault("pending_summary", {})
+    if not isinstance(pending_summary, dict):
+        state["pending_summary"] = {}
     for item in state["pending"]:
         if item.get("delivery_status") == "sending":
             item["delivery_status"] = "queued"
@@ -1079,6 +1083,41 @@ def format_notification(title: str, body: str, part: str = "") -> str:
     spacing = f"\n{WECHAT_BLANK_LINE}\n"
     footer = f"（{QUOTE_FOOTER}。{QUEUE_HINT}）"
     return f"【{clean_title}】{spacing}{part_line}{body}{spacing}{footer}"
+
+
+def format_pending_summary(items: list[dict[str, Any]]) -> str:
+    """Summarize undelivered replies without exposing their answer text."""
+    counts: dict[str, int] = {}
+    for item in items:
+        title = clean_chat_title(str(item.get("title") or "未命名任务"))
+        counts[title] = counts.get(title, 0) + 1
+    lines = [f"【{title}】{count}条" for title, count in counts.items()]
+    spacing = f"\n{WECHAT_BLANK_LINE}\n"
+    return "积压消息汇总" + spacing + "\n".join(lines)
+
+
+def is_expired_wechat_context(detail: str | None) -> bool:
+    normalized = str(detail or "").lower()
+    return "context_token" in normalized and any(
+        marker in normalized
+        for marker in ("expired", "no fresh", "no stored", "missing")
+    )
+
+
+def activate_pending_summary(state: dict[str, Any], now: int | None = None) -> None:
+    current = state.get("pending_summary")
+    if not isinstance(current, dict):
+        current = {}
+    if current.get("active"):
+        state["pending_summary"] = current
+        return
+    timestamp = int(time.time()) if now is None else int(now)
+    state["pending_summary"] = {
+        "active": True,
+        "started_at": timestamp,
+        "attempts": 0,
+        "next_retry_at": timestamp + 30,
+    }
 
 
 def split_answer(title: str, answer: str, max_chars: int) -> list[str]:
@@ -2069,10 +2108,21 @@ def remember_wechat_session(state: dict[str, Any], payload: dict[str, Any]) -> b
     if not user_id or len(user_id) > 500 or any(char in user_id for char in "\r\n\x00"):
         return False
     session_key = f"weixin:dm:{user_id}"
-    if state.get("wechat_session_key") == session_key:
-        return False
-    state["wechat_session_key"] = session_key
-    return True
+    changed = state.get("wechat_session_key") != session_key
+    if changed:
+        state["wechat_session_key"] = session_key
+
+    # Every inbound WeChat request may carry a freshly issued context_token to
+    # cc-connect, even when the peer/session key itself has not changed. Wake a
+    # suspended backlog summary immediately instead of waiting for its previous
+    # exponential-backoff deadline.
+    pending_summary = state.get("pending_summary")
+    if isinstance(pending_summary, dict) and pending_summary.get("active"):
+        if int(pending_summary.get("next_retry_at", 0)) != 0:
+            pending_summary["next_retry_at"] = 0
+            pending_summary["attempts"] = 0
+            changed = True
+    return changed
 
 
 def parse_reply_mode(reply_text: str) -> tuple[str, str]:
@@ -2440,6 +2490,7 @@ def toggle_pinned_push(
         state["push_enabled"] = enabled
         if not enabled:
             state["pending"].clear()
+            state["pending_summary"] = {}
         if request_id:
             state["handled_message_ids"][request_id] = int(time.time())
             state["handled_message_ids"] = trim_timestamp_dict(
@@ -2489,6 +2540,10 @@ def health_status(config: dict[str, Any], state: dict[str, Any]) -> dict[str, An
         "ok": True,
         "version": NOTIFIER_VERSION,
         "pending_notifications": len(state.get("pending", [])),
+        "pending_summary_active": bool(
+            isinstance(state.get("pending_summary"), dict)
+            and state.get("pending_summary", {}).get("active")
+        ),
         "queued_wechat_replies": len(state.get("reply_queue", [])),
         "push_enabled": bool(state.get("push_enabled", True)),
         "pinned_project_push_enabled": bool(
@@ -3069,30 +3124,104 @@ def deliver_pending(
     delivered = 0
     while True:
         now = int(time.time())
+        summary_claims: list[dict[str, Any]] | None = None
         with state_lock:
             if not bool(state.get("push_enabled", True)):
                 return delivered
-            item = next(
-                (
-                    entry
-                    for entry in state["pending"]
-                    if entry.get("delivery_status", "queued") == "queued"
-                    and int(entry.get("next_retry_at", 0)) <= now
-                ),
-                None,
+            pending_summary = state.get("pending_summary")
+            summary_active = bool(
+                isinstance(pending_summary, dict) and pending_summary.get("active")
             )
-            if item is None:
+            if summary_active:
+                if not state["pending"]:
+                    state["pending_summary"] = {}
+                    save_state(state_path, state)
+                    return delivered
+                if int(pending_summary.get("next_retry_at", 0)) > now:
+                    return delivered
+                summary_claims = [dict(entry) for entry in state["pending"]]
+                session_key = str(state.get("wechat_session_key") or "")
+            else:
+                item = next(
+                    (
+                        entry
+                        for entry in state["pending"]
+                        if entry.get("delivery_status", "queued") == "queued"
+                        and int(entry.get("next_retry_at", 0)) <= now
+                    ),
+                    None,
+                )
+                if item is None:
+                    return delivered
+                item["delivery_status"] = "sending"
+                claim = dict(item)
+                session_key = str(state.get("wechat_session_key") or "")
+                save_state(state_path, state)
+
+        if summary_claims is not None:
+            message = format_pending_summary(summary_claims)
+            ok, detail = send_via_cc_connect(config, message, session_key)
+            with state_lock:
+                if ok:
+                    turn_ids = {
+                        str(entry.get("turn_id") or "") for entry in summary_claims
+                    }
+                    state["pending"] = [
+                        entry
+                        for entry in state["pending"]
+                        if str(entry.get("turn_id") or "") not in turn_ids
+                    ]
+                    timestamp = int(time.time())
+                    for turn_id in turn_ids:
+                        if turn_id:
+                            state["sent_turns"][turn_id] = timestamp
+                    trim_sent_history(state, int(config["sent_history_limit"]))
+                    state["pending_summary"] = {}
+                    save_state(state_path, state)
+                    delivered += len([turn_id for turn_id in turn_ids if turn_id])
+                    logger.info(
+                        "Sent pending summary conversations=%s turns=%s",
+                        len(
+                            {
+                                clean_chat_title(str(entry.get("title") or "未命名任务"))
+                                for entry in summary_claims
+                            }
+                        ),
+                        len(summary_claims),
+                    )
+                else:
+                    pending_summary = state.get("pending_summary")
+                    if not isinstance(pending_summary, dict):
+                        pending_summary = {"active": True}
+                        state["pending_summary"] = pending_summary
+                    attempts = int(pending_summary.get("attempts", 0)) + 1
+                    pending_summary["active"] = True
+                    pending_summary["attempts"] = attempts
+                    pending_summary["next_retry_at"] = int(time.time()) + min(
+                        300, 30 * (2 ** min(attempts - 1, 4))
+                    )
+                    save_state(state_path, state)
+                    logger.warning(
+                        "Pending summary send failed conversations=%s turns=%s error=%s",
+                        len(
+                            {
+                                clean_chat_title(str(entry.get("title") or "未命名任务"))
+                                for entry in summary_claims
+                            }
+                        ),
+                        len(summary_claims),
+                        detail or "unknown error",
+                    )
+            if not ok:
                 return delivered
-            item["delivery_status"] = "sending"
-            claim = dict(item)
-            session_key = str(state.get("wechat_session_key") or "")
-            save_state(state_path, state)
+            continue
 
         chunks = split_answer(
             str(claim["title"]), str(claim["answer"]), int(config["max_message_chars"])
         )
         next_chunk = int(claim.get("next_chunk", 0))
         failed = False
+        context_expired = False
         while next_chunk < len(chunks):
             ok, detail = send_via_cc_connect(
                 config,
@@ -3116,6 +3245,9 @@ def deliver_pending(
                         item["next_retry_at"] = int(time.time()) + min(
                             3600, 30 * (2 ** min(attempts - 1, 7))
                         )
+                        if is_expired_wechat_context(detail):
+                            activate_pending_summary(state)
+                            context_expired = True
                         save_state(state_path, state)
                     logger.warning(
                         "Send failed thread=%s turn=%s chunk=%s/%s error=%s",
@@ -3150,6 +3282,8 @@ def deliver_pending(
             if failed or item is None:
                 break
         if failed:
+            if context_expired:
+                return delivered
             continue
         with state_lock:
             item = next(

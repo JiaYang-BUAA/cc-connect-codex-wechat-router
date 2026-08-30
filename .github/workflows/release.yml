@@ -70,7 +70,7 @@ jobs:
           $version = if ('${{ github.ref_type }}' -eq 'tag') {
             '${{ github.ref_name }}'.TrimStart('v')
           } else {
-            '1.2.0-ci'
+            '1.3.0-ci'
           }
           .\tools\build-release-package.ps1 `
             -CcConnectSourceRoot (Join-Path $PWD 'cc-connect-source') `

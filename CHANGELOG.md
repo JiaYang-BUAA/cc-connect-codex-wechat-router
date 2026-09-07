@@ -5,6 +5,12 @@ Python notifier unless a cc-connect routing patch is named explicitly.
 
 ## [Unreleased]
 
+- Identify 5-hour and 7-day quota windows by their reported duration, including
+  weekly-only accounts with the weekly window in `primary`. Prefer the named
+  Codex bucket and avoid mixing model-specific quotas into `/rw` or alerts.
+- Clear previously mislabeled alert stages on quota refresh.
+- Document sending `/rw` before use and the community-reported Weixin push limit.
+
 ## [1.3.0] - 2026-08-30
 
 - Added cached 5-hour and 7-day Codex quota status to `/rw`, including local

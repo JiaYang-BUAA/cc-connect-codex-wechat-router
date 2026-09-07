@@ -766,6 +766,74 @@ codex_quote_router_token = "test-secret-token"
         self.assertEqual(windows["7d"]["remaining_percent"], 0)
         self.assertNotIn("planType", json.dumps(windows))
 
+    def test_weekly_only_primary_is_reported_and_alerted_as_7d(self):
+        windows = notifier.normalize_quota_limits({"rateLimits": {
+            "primary": {"usedPercent": 95, "windowDurationMins": 10080, "resetsAt": 1800000000},
+            "secondary": None,
+        }})
+        self.assertEqual(set(windows), {"7d"})
+        self.assertEqual(windows["7d"]["remaining_percent"], 5)
+        message = notifier.format_quota_lines(windows)
+        self.assertIn("5h额度：暂时无法读取", message)
+        self.assertIn("7d额度：5%", message)
+        self.assertEqual(notifier.plan_quota_alerts(notifier.empty_state(), windows, 10), {"7d": "low"})
+
+    def test_quota_windows_follow_duration_when_positions_are_swapped(self):
+        windows = notifier.normalize_quota_limits({"rateLimits": {
+            "primary": {"usedPercent": 15, "windowDurationMins": 10080},
+            "secondary": {"usedPercent": 30, "windowDurationMins": 300},
+        }})
+        self.assertEqual(windows["7d"]["remaining_percent"], 85)
+        self.assertEqual(windows["5h"]["remaining_percent"], 70)
+
+    def test_named_codex_bucket_takes_precedence_without_spark_fallback(self):
+        spark = {"limitId": "codex_bengalfox", "primary": {
+            "usedPercent": 0, "windowDurationMins": 300,
+        }}
+        codex = {"primary": {"usedPercent": 15, "windowDurationMins": 10080}}
+        windows = notifier.normalize_quota_limits({
+            "rateLimits": spark,
+            "rateLimitsByLimitId": {"codex": codex, "codex_bengalfox": spark},
+        })
+        self.assertEqual(set(windows), {"7d"})
+        self.assertEqual(windows["7d"]["remaining_percent"], 85)
+        for result in (
+            {"rateLimits": spark},
+            {"rateLimitsByLimitId": {"codex_bengalfox": spark}},
+            {"rateLimits": spark, "rateLimitsByLimitId": {"codex": {}}},
+        ):
+            with self.subTest(result=result), self.assertRaises(ValueError):
+                notifier.normalize_quota_limits(result)
+
+    def test_unknown_quota_durations_are_not_guessed(self):
+        for duration in (None, True, "300", 60, 300.5, float("nan"), float("inf")):
+            with self.subTest(duration=duration):
+                windows = notifier.normalize_quota_limits({"rateLimits": {
+                    "primary": {"usedPercent": 10, "windowDurationMins": duration},
+                    "secondary": {"usedPercent": 20, "windowDurationMins": 10080},
+                }})
+                self.assertEqual(set(windows), {"7d"})
+
+    def test_quota_refresh_removes_mislabeled_cached_alert_stage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = notifier.empty_state()
+            state["quota_status"] = {"windows": {
+                "5h": {"remaining_percent": 5, "window_duration_mins": 10080},
+            }}
+            state["quota_alert_stages"] = {"5h": "low"}
+            monitor = mock.Mock()
+            monitor.read.return_value = {"7d": {
+                "remaining_percent": 5, "window_duration_mins": 10080,
+            }}
+            with mock.patch.object(notifier, "send_via_cc_connect") as send:
+                self.assertTrue(notifier.refresh_quota_status(
+                    {}, state, Path(temp) / "state.json", threading.RLock(), monitor,
+                    notifier.logging.getLogger("test-quota-migration"),
+                ))
+            send.assert_not_called()
+            self.assertNotIn("5h", state["quota_alert_stages"])
+            self.assertEqual(set(state["quota_status"]["windows"]), {"7d"})
+
     def test_rw_status_includes_cached_quota_before_push_settings(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -85,6 +85,14 @@ the source-build commands below.
 After installation, send `/rw` in Weixin. A pinned-task list confirms that the
 notifier, local router, and Weixin response path are connected.
 
+> **Send `/rw` before each usage session.** This is especially important after
+> a long period without interacting with the bot, before submitting work from
+> Weixin, or while waiting for a final Codex answer. Wait for the status reply
+> before continuing. The inbound message activates the current interactive
+> context and provides a normal reactive reply opportunity, which improves later
+> delivery reliability. It is not permanent keepalive and cannot guarantee that
+> an existing gateway push restriction is removed immediately.
+
 ## Weixin Commands
 
 ```text
@@ -104,7 +112,8 @@ notifier, local router, and Weixin response path are connected.
    to operate from Weixin.
 2. Make sure both `cc-connect` and this notifier are running. Use
    `notifier.py --selftest` to validate configuration and the loopback router.
-3. Send `/rw` in Weixin. The notifier first shows the remaining 5-hour and
+3. At the start of each usage session, or after a long idle period, send `/rw`
+   in Weixin to activate the current interactive context. The notifier first shows the remaining 5-hour and
    7-day Codex quota and reset times, then lists pinned tasks in the current
    Codex Desktop sidebar order, including task number, runtime status, and
    elapsed time.
@@ -187,25 +196,42 @@ archive a separate execution task for each scheduled run; its new final answer
 is associated with the pinned automation target so quoting the notification or
 using `/rw<number> content` continues the target task.
 
-### Weixin `context_token` expiry and backlog summaries
+### Weixin interaction activation, proactive-push limits, and backlog summaries
 
 `context_token` is a temporary reply credential issued by the Weixin gateway
-with an inbound user message. cc-connect must include it when proactively sending
-a completed Codex answer to that Weixin conversation. It is not a Weixin login
+with an inbound user message. cc-connect includes the current conversation token
+when sending. It is not a Weixin login
 credential, a Codex API key, or a Codex usage-limit token, and its expiry does not
 stop the underlying Codex task.
 
 When the user messages the bot, the gateway may issue a fresh `context_token`,
-which cc-connect caches for later notifications. Persisting the token only lets
-cc-connect reload it after a restart; it does not extend server-side validity.
-The gateway does not publish a fixed lifetime. Inactivity, login or conversation
-changes, gateway rotation, and risk controls may all invalidate an older token,
-so a fixed periodic refresh cannot reliably prevent expiry.
+and that inbound message also permits a normal reactive reply. cc-connect caches
+the token for later use, but persistence does not extend server-side validity.
+Continuous `getUpdates` long polling only receives messages; it does not refresh
+the interactive context or proactive-push budget. The gateway publishes neither
+a renewal endpoint nor a fixed token lifetime or proactive-push allowance.
+
+Community reports, including user reports on Xiaohongshu, indicate that after an
+inbound user message activates an interaction, the bot may proactively send at
+most approximately **10 messages** during that interaction. This is not a fixed
+allowance guaranteed by Tencent's public API documentation, and an account may
+be restricted before reaching 10 messages depending on account state, send rate,
+timing, and gateway risk controls. This project documents “up to approximately
+10” as a risk warning, not as a dependable delivery guarantee.
+
+**Before controlling Codex from Weixin, send `/rw` and wait for its status
+reply.** Send it again after a long idle period. This activates a new interaction
+and improves the likelihood of subsequent notifications, but it is not permanent
+keepalive and cannot guarantee immediate removal of an existing server-side
+restriction. Do not send scheduled bot heartbeats as keepalive: they are
+proactive pushes themselves and can consume the limited push budget faster.
 
 Typical symptoms are a completed Codex task with no Weixin notification and a
-cc-connect or notifier log containing `ret=-2`, `expired context_token`, or an
-instruction that the user must message the bot again. This is a Weixin delivery
-authorization failure, not a failed Codex task or exhausted Codex quota.
+cc-connect or notifier log containing `ret=-2`, `prepare failed`,
+`expired context_token`, or an instruction that the user must message the bot
+again. `ret=-2` alone does not prove token expiry; current cc-connect upstream
+treats it as a bot-wide proactive-push throttle. In either case, Weixin rejected
+the send; the Codex task did not fail and its quota was not exhausted.
 
 The notifier handles this condition as follows:
 

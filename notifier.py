@@ -716,24 +716,30 @@ def read_catalog_titles(config: dict[str, Any], thread_ids: list[str]) -> dict[s
 
 def normalize_quota_limits(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Return the Codex 5-hour and 7-day quota windows without account data."""
-    bucket = result.get("rateLimits")
+    buckets = result.get("rateLimitsByLimitId")
+    bucket = buckets.get("codex") if isinstance(buckets, dict) else None
     if not isinstance(bucket, dict):
-        buckets = result.get("rateLimitsByLimitId")
-        bucket = buckets.get("codex") if isinstance(buckets, dict) else None
+        bucket = result.get("rateLimits")
+        if isinstance(bucket, dict) and bucket.get("limitId") not in (None, "codex"):
+            bucket = None
     if not isinstance(bucket, dict):
         raise ValueError("Codex rate limit bucket is unavailable")
 
     windows: dict[str, dict[str, Any]] = {}
-    for key, field, expected_minutes in (
-        ("5h", "primary", 300),
-        ("7d", "secondary", 10_080),
-    ):
+    for field in ("primary", "secondary"):
         raw = bucket.get(field)
         if not isinstance(raw, dict):
             continue
         used_raw = raw.get("usedPercent")
         reset_raw = raw.get("resetsAt")
         duration_raw = raw.get("windowDurationMins")
+        # A weekly-only account can put its 7-day window in primary.
+        # Missing/unknown durations must not be guessed from field position.
+        if isinstance(duration_raw, bool) or not isinstance(duration_raw, (int, float)):
+            continue
+        key = {300: "5h", 10_080: "7d"}.get(duration_raw)
+        if key is None:
+            continue
         if isinstance(used_raw, bool) or not isinstance(used_raw, (int, float)):
             continue
         used = float(used_raw)
@@ -748,16 +754,10 @@ def normalize_quota_limits(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
             and float(reset_raw) > 0
             else 0
         )
-        duration = (
-            int(duration_raw)
-            if isinstance(duration_raw, (int, float))
-            and not isinstance(duration_raw, bool)
-            else expected_minutes
-        )
         windows[key] = {
             "remaining_percent": remaining,
             "resets_at": resets_at,
-            "window_duration_mins": duration,
+            "window_duration_mins": int(duration_raw),
         }
     if not windows:
         raise ValueError("Codex rate limit windows are unavailable")
@@ -1528,6 +1528,13 @@ def refresh_quota_status(
 
     warning_percent = float(config.get("quota_warning_percent", 10))
     with state_lock:
+        previous = state.get("quota_status") or {}
+        previous_windows = previous.get("windows") or {}
+        for key, expected_minutes in (("5h", 300), ("7d", 10_080)):
+            cached = previous_windows.get(key) or {}
+            if cached.get("window_duration_mins", expected_minutes) != expected_minutes:
+                # Discard alert stages recorded under the old, incorrect label.
+                state.setdefault("quota_alert_stages", {}).pop(key, None)
         state["quota_status"] = {
             "updated_at": int(time.time()),
             "windows": windows,

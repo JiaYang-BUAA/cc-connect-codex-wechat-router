@@ -7,33 +7,38 @@
 [![Windows](https://img.shields.io/badge/platform-Windows-0078D4.svg)](https://www.microsoft.com/windows)
 
 Windows companion service for `cc-connect` and Codex Desktop. It sends final
-answers from currently pinned Codex Desktop tasks to an existing Weixin
-session, then routes quoted replies back to the matching task.
+answers from pinned tasks or the 10 most recently active tasks to an existing
+Weixin session, then routes quoted replies back to the matching task.
 
 This repository does not contain credentials, Codex databases, transcripts, or
 the upstream cc-connect source. End-user GitHub Releases include a verified
 custom `cc-connect.exe`; its Go source remains in the author's `quote-router`
 fork branch, and every bundle records the pinned source commit.
 
-> Current stable pair: notifier `1.3.0` and cc-connect routing patch
-> `v1.4.1+qr15`.
+> Current stable pair: notifier `1.4.0` and cc-connect routing patch
+> `v1.4.1+qr16`.
 
 ## Features
 
-- Pushes final answers from individually pinned, unarchived Desktop user tasks.
-- Recognizes individually pinned Codex automations, pushes new scheduled run
-  results, and routes quoted replies to the automation's target task.
-- `/rwfolder` optionally includes every task inside pinned Desktop projects.
-- `/rw` shows remaining 5-hour and 7-day quota with reset times, then lists pinned tasks in current sidebar order and runtime status.
+- `/rwmode` switches between pinned tasks (the default) and the 10 most
+  recently active unarchived user tasks, including idle tasks.
+- Pinned mode retains individually pinned tasks, pinned automations, and the
+  optional `/rwfolder` inclusion of tasks inside pinned Desktop projects.
+- Recognizes new Codex automation results and routes quoted replies to the
+  target task; temporary execution tasks do not occupy separate recent slots.
+- `/rw` shows remaining 5-hour and 7-day quota with reset times, then the
+  current mode's task list, runtime status, and queue counts.
 - A Weixin alert is sent once when either quota first falls to 10% or below, and once more if it reaches 0%; alerts re-arm after recovery.
-- `/rw3 内容` routes to pinned task 3; `/rw3 /y 内容` submits directly.
+- `/rw3 内容` routes to item 3 in the current task list; `/rw3 /y 内容` submits
+  directly. Recent-mode numbers stay attached to the last returned list until
+  `/rw` refreshes it.
 - Quoted normal replies queue while a task is active.
 - Ordinary queued replies are written to Codex Desktop's native queue above
   the composer, where they can be edited, reordered, or removed; the notifier
   queue is retained as a fallback when the native transport is unavailable.
 - Quoting a queue acknowledgement and replying `/y` directly submits the
   original queued message.
-- `/rwpush` toggles final-answer push notifications.
+- `/rwpush` is the shared final-answer push switch for both modes.
 - `/hp` shows an in-Weixin, beginner-friendly usage guide.
 - Quoted Weixin voice messages use Weixin's recognized text.
 - Durable queues, retry backoff, duplicate suppression, loopback-only routing,
@@ -82,8 +87,9 @@ The first run establishes a file-offset baseline and does not resend historical
 answers. Advanced users can still use `config.example.json`, `install.ps1`, and
 the source-build commands below.
 
-After installation, send `/rw` in Weixin. A pinned-task list confirms that the
-notifier, local router, and Weixin response path are connected.
+After installation, send `/rw` in Weixin. A reply showing quota, push mode,
+and task status confirms that the notifier, local router, and Weixin response
+path are connected.
 
 > **Send `/rw` before each usage session.** This is especially important after
 > a long period without interacting with the bot, before submitting work from
@@ -96,38 +102,70 @@ notifier, local router, and Weixin response path are connected.
 ## Weixin Commands
 
 ```text
-/rw                         Show pinned task order and status
-/rw3 内容                   Queue or submit content to pinned task 3
-/rw3 /y 内容                Directly submit content to pinned task 3
-/rwpush                    Toggle final-answer push notifications
-/rwfolder                  Toggle replies from tasks in pinned projects
-/hp                        Show the detailed usage guide
+/rw                         Show the current task list and quota
+/rwmode                     Switch between pinned and recent modes
+/rwmode pinned              Select pinned tasks (the default)
+/rwmode recent              Select the 10 most recently active tasks
+/rw3 内容                   Queue or submit content to item 3 in the task list
+/rw3 /y 内容                Directly submit content to item 3 in the task list
+/rwpush                     Toggle final-answer push (shared by both modes)
+/rwfolder                   Toggle pinned-project replies (pinned mode only)
+/hp                         Show the detailed usage guide
 ```
 
 ## Usage Guide
 
 ### First-time setup
 
-1. Sign in to Codex Desktop and pin the regular tasks or automations you want
-   to operate from Weixin.
+1. Sign in to Codex Desktop. Pinned mode is the default, so pin the regular
+   tasks or automations you want to operate from Weixin. Alternatively, select
+   recently active tasks later with `/rwmode recent`.
 2. Make sure both `cc-connect` and this notifier are running. Use
    `notifier.py --selftest` to validate configuration and the loopback router.
 3. At the start of each usage session, or after a long idle period, send `/rw`
-   in Weixin to activate the current interactive context. The notifier first shows the remaining 5-hour and
-   7-day Codex quota and reset times, then lists pinned tasks in the current
-   Codex Desktop sidebar order, including task number, runtime status, and
-   elapsed time.
+   in Weixin to activate the current interactive context. The notifier shows
+   the remaining 5-hour and 7-day Codex quota and reset times, then the current
+   mode's task list, including task number, runtime status, and elapsed time.
 4. Use the displayed number with `/rw<number> content` to send a new message
-   to a specific pinned task.
+   to a specific task in that list.
 
 ### Check task status
 
-`/rw` shows the remaining 5-hour and 7-day quota and every currently pinned
-   task, including individually pinned automations. A running task shows its processing
-   time; an idle task shows `空闲`. If no tasks are pinned, the response says so.
-   Numbers follow the current pinned order and can change when tasks are
-   unpinned or archived. If quota reading is temporarily unavailable, task
-   status is still returned normally.
+`/rw` shows the remaining 5-hour and 7-day quota, reset times, push mode, and
+current task list. A running task shows its processing time; an idle task
+shows `空闲`. If no tasks qualify, the reply still shows quota and switches
+and explains that the list is empty. If quota reading is temporarily
+unavailable, task status is still returned normally.
+
+Pinned mode follows the current Codex Desktop sidebar order, including
+individually pinned automations; numbers can change when tasks are unpinned
+or archived. Recent mode sorts by the latest conversation activity and saves
+the returned list so new activity does not change numbers you just received.
+
+### Choose a push mode
+
+Send `/rwmode` to switch between modes, or select one explicitly:
+
+- `/rwmode pinned`: the default. Push final answers from individually pinned,
+  unarchived tasks and, when `/rwfolder` is enabled, tasks in pinned projects.
+- `/rwmode recent`: select up to 10 unarchived user tasks, newest first by
+  the conversation activity time recorded by Codex. Both user messages and
+  task replies count as activity, and idle tasks are included. This means
+  10 tasks, not 10 messages or only tasks that are currently running.
+
+Subagent tasks are excluded. Temporary automation executions are associated
+with their target task instead of occupying an additional slot.
+
+A mode change returns the new task list. The recent-mode **push selection
+updates dynamically**, but `/rw<number> content` uses the last list returned
+by `/rw` or a mode change. Send `/rw` again to refresh its numbers. For example,
+if item 3 was “Research,” `/rw3 content` continues to reach “Research” even
+when another task becomes active, until you refresh the list.
+
+Both modes share `/rwpush`. Changing modes leaves that switch unchanged and
+does not replay historical answers from newly selected tasks. Previously
+accepted instructions, queued replies, and notification backlogs are retained
+and continue to be processed.
 
 ### Reply to a final answer
 
@@ -163,7 +201,26 @@ You can also quote a queue acknowledgement and send only `/y` to promote the
    complete Codex notification or queue acknowledgement. Unrecognized quotes
    receive a prompt to quote the latest complete answer again.
 
-### Continue by pinned-task number
+In either mode, a notification with a saved routing record still reaches its
+original task after a mode change, unpinning, or leaving the recent top 10.
+Archived, deleted, or unavailable tasks remain blocked, and unknown quotes
+never guess a target. Push mode controls automatic notifications, not the
+target of an old quote: submissions outside the current scope are accepted,
+but their final answers are still subject to the current notification scope.
+
+### Continue by task number
+
+An “已提交” (submitted) receipt means Desktop confirmed acceptance or native
+queue insertion, not that execution finished. If transfer fails, the receipt
+instead says the message is saved and waiting to be forwarded. Do not resend:
+the notifier retains it for retry. Ambiguous submissions, such as a lost CDP
+response, are checked against the native queue and task history first.
+
+The transport supports newer Desktop server-side queues and legacy local
+queues separately; it does not overwrite a server-side queue with local state.
+Explicit queue submission is independent of Desktop's default send mode.
+Desktop internals may still change across releases; keep pending messages and
+check the logs when an integration error occurs.
 
 Use `/rw<number> content` when the older notification is difficult to find:
 
@@ -171,30 +228,39 @@ Use `/rw<number> content` when the older notification is difficult to find:
 /rw3 Continue the analysis using the previous result
 ```
 
-This routes the message to the current third pinned task. Use `/rw3 /y content`
-   for direct submission. If the task is no longer pinned or has been archived,
-   the notifier reports that it cannot continue the conversation.
+This routes the message to item 3 in the current task list. Use `/rw3 /y content`
+for direct submission. Pinned mode uses the current pinned order. Recent mode
+uses the last list returned by `/rw` or a mode change: a task leaving the top
+10 does not silently assign its number to another task. Archived tasks, or
+tasks outside the permitted pinned scope while in pinned mode, cannot receive
+new submissions.
 
 ### Control final-answer notifications
 
-Send `/rwpush` to toggle final-answer push notifications. The response is
-   either “置顶任务回复推送已开启” or “置顶任务回复推送已关闭”. This toggle
-   affects notifications only; it does not stop Codex tasks, clear queues, or
-   disable Weixin submissions.
+Send `/rwpush` to toggle the shared final-answer push switch. The response
+reports whether push is enabled for the current mode. Changing modes does not
+automatically enable or disable push. This toggle affects notifications only;
+it does not stop Codex tasks, clear queues, or disable Weixin submissions.
 
-Send `/rwfolder` to independently include or exclude tasks inside pinned Codex
-Desktop projects. It is off by default. When enabled, an unarchived task in a
-pinned project is pushed even if that task is not individually pinned, and the
-notification can still be quoted to continue the exact task. `/rw` numbering
-continues to list only individually pinned tasks so large projects do not fill
-the numbered command list.
+In pinned mode, send `/rwfolder` to independently include or exclude tasks
+inside pinned Codex Desktop projects. It is off by default and follows the
+`/rwpush` master switch. When enabled, an unarchived task in a pinned project
+is pushed even if that task is not individually pinned, and the notification
+can still be quoted to continue the exact task. Pinned-mode `/rw` numbering
+continues to list only individually pinned tasks so large projects do not
+fill the numbered command list.
 
-Individually pinned automations do not depend on `/rwfolder`; like other
-individually pinned tasks, they follow the `/rwpush` master switch. Existing
-scheduled run history is baselined and is not replayed. Codex may create and
-archive a separate execution task for each scheduled run; its new final answer
-is associated with the pinned automation target so quoting the notification or
-using `/rw<number> content` continues the target task.
+Recent mode does not use the pinned-project switch. Sending `/rwfolder` in
+recent mode only explains that it applies to pinned mode; it does not change
+the saved setting. Switching back to pinned mode restores its prior effect.
+
+In pinned mode, individually pinned automations do not depend on `/rwfolder`;
+like other individually pinned tasks, they follow the `/rwpush` master switch.
+Only newly completed runs within the current push selection are notified;
+scheduled run history is not replayed. Codex may create and archive a separate
+execution task for each scheduled run. Its new final answer is associated
+with the automation target so quoting the notification, or using its number
+in the current task list, continues the target task.
 
 ### Weixin interaction activation, proactive-push limits, and backlog summaries
 
@@ -336,14 +402,17 @@ Codex Desktop DB/rollouts
 ```
 
 The notifier never exposes the router outside loopback and does not log answer
-bodies or credentials. The Desktop pinned order is read from
-`.codex-global-state.json`; numbering is current-state numbering, not a
-permanent task identifier.
+bodies or credentials. Pinned order and project membership come from Desktop
+global state; recent activity comes from task records. Pinned mode uses the
+current pinned order, while recent mode saves numbers from the last returned
+list. Neither numbering scheme is a permanent task identifier.
 
 ## Troubleshooting
 
-- **`/rw` reports no pinned tasks:** pin at least one unarchived task in Codex
-  Desktop. Tasks created only inside cc-connect are not part of this list.
+- **`/rw` reports no tasks:** in pinned mode, pin at least one unarchived task
+  in Codex Desktop, or switch to `/rwmode recent`. In recent mode, confirm
+  that Desktop has unarchived user tasks and refresh with `/rw`. Independent
+  sessions created only inside cc-connect are not part of these lists.
 - **Commands receive no response:** verify the `cc-connect` and
   `Codex Pinned WeChat Notifier` scheduled tasks, run `--selftest`, then inspect
   the notifier and daemon logs.

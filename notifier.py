@@ -29,10 +29,11 @@ from websocket_transport import SharedAppServerProcess, WebSocketConnection
 
 
 STATE_VERSION = 2
-NOTIFIER_VERSION = "1.3.0"
+NOTIFIER_VERSION = "1.4.0"
 QUOTE_FOOTER = "↩ 引用此条信息进行回复"
 QUEUE_HINT = "如任务正在处理，则默认排队，直接提交请加前缀“/y”"
 WECHAT_BLANK_LINE = "\u200b"
+RECENT_TASK_LIMIT = 10
 _state_write_snapshots: dict[str, str] = {}
 _state_write_snapshots_lock = threading.Lock()
 
@@ -144,6 +145,8 @@ def empty_state() -> dict[str, Any]:
         "reply_queue": [],
         "handled_message_ids": {},
         "push_enabled": True,
+        "push_mode": "pinned",
+        "recent_task_order": [],
         "pinned_project_push_enabled": False,
         "automation_runs_initialized": False,
         "quota_status": {},
@@ -178,6 +181,9 @@ def load_state(path: Path) -> dict[str, Any]:
     state.setdefault("reply_queue", [])
     state.setdefault("handled_message_ids", {})
     state.setdefault("push_enabled", True)
+    if state.get("push_mode") not in {"pinned", "recent"}:
+        state["push_mode"] = "pinned"
+    state.setdefault("recent_task_order", [])
     state.setdefault("pinned_project_push_enabled", False)
     state.setdefault("automation_runs_initialized", False)
     state.setdefault("quota_status", {})
@@ -353,6 +359,14 @@ def apply_automation_metadata(
         row["title"] = definition["name"]
 
 
+def activity_timestamp_sql(db: sqlite3.Connection) -> str:
+    columns = {row[1] for row in db.execute("PRAGMA table_info(threads)")}
+    expression = "updated_at * 1000" if "updated_at" in columns else "0"
+    if "updated_at_ms" in columns:
+        expression = f"COALESCE(NULLIF(updated_at_ms, 0), {expression})"
+    return expression
+
+
 def read_desktop_threads(config: dict[str, Any]) -> list[dict[str, Any]]:
     db_path = Path(config["codex_db"]).resolve()
     uri = db_path.as_uri() + "?mode=ro"
@@ -361,7 +375,8 @@ def read_desktop_threads(config: dict[str, Any]) -> list[dict[str, Any]]:
         return []
     placeholders = ",".join("?" for _ in sources)
     sql = f"""
-        SELECT id, title, rollout_path, is_pinned, model, reasoning_effort, cwd
+        SELECT id, title, rollout_path, is_pinned, model, reasoning_effort, cwd,
+               {{activity_column}} AS activity_at_ms
         FROM threads
         WHERE archived = 0
           AND rollout_path IS NOT NULL
@@ -372,16 +387,28 @@ def read_desktop_threads(config: dict[str, Any]) -> list[dict[str, Any]]:
     try:
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA query_only = ON")
+        sql = sql.format(activity_column=activity_timestamp_sql(db))
         rows = [dict(row) for row in db.execute(sql, sources).fetchall()]
     finally:
         db.close()
     pinned_ids, pinned_project_thread_ids = read_sidebar_pin_state(config)
     catalog_titles = read_catalog_titles(config, [str(row["id"]) for row in rows])
     for row in rows:
+        row["is_automation_run"] = bool(automation_id_from_title(str(row.get("title") or "")))
         display_title = catalog_titles.get(str(row["id"]))
         if display_title:
             row["title"] = display_title
     apply_automation_metadata(rows, config)
+    by_id = {str(row["id"]): row for row in rows}
+    for row in rows:
+        if row.get("is_automation_target"):
+            row["is_automation_run"] = False
+    for run in read_automation_runs(config):
+        target = by_id.get(str(run.get("route_thread_id") or ""))
+        if target is not None:
+            target["activity_at_ms"] = max(
+                int(target.get("activity_at_ms") or 0), int(run.get("activity_at_ms") or 0),
+            )
     if pinned_ids is None:
         for row in rows:
             row["is_project_pinned"] = (
@@ -420,7 +447,7 @@ def read_automation_runs(config: dict[str, Any]) -> list[dict[str, Any]]:
     placeholders = ",".join("?" for _ in sources)
     sql = f"""
         SELECT id, title, rollout_path, archived, source, thread_source,
-               model, reasoning_effort, cwd
+               model, reasoning_effort, cwd, {{activity_column}} AS activity_at_ms
         FROM threads
         WHERE rollout_path IS NOT NULL
           AND thread_source = 'automation'
@@ -430,7 +457,9 @@ def read_automation_runs(config: dict[str, Any]) -> list[dict[str, Any]]:
     try:
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA query_only = ON")
-        rows = [dict(row) for row in db.execute(sql, sources).fetchall()]
+        rows = [dict(row) for row in db.execute(
+            sql.format(activity_column=activity_timestamp_sql(db)), sources,
+        ).fetchall()]
     finally:
         db.close()
 
@@ -468,9 +497,39 @@ def read_monitored_threads(
     config: dict[str, Any], state: dict[str, Any]
 ) -> list[dict[str, Any]]:
     threads = {str(row["id"]): row for row in read_desktop_threads(config)}
+    recent_ids = {str(row["id"]) for row in select_recent_threads(list(threads.values()))}
     for row in read_automation_runs(config):
         threads[str(row["id"])] = row
+    for row in threads.values():
+        row["is_recent"] = str(row.get("route_thread_id") or row["id"]) in recent_ids
     return list(threads.values())
+
+
+def push_mode(state: dict[str, Any]) -> str:
+    return "recent" if state.get("push_mode") == "recent" else "pinned"
+
+
+def push_mode_label(state: dict[str, Any]) -> str:
+    return "近10条活跃任务" if push_mode(state) == "recent" else "置顶任务"
+
+
+def select_recent_threads(threads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # Temporary automation executions route through their target, not a second slot.
+    candidates = [row for row in threads if not row.get("archived") and not (
+        row.get("is_automation_run") or (
+            automation_id_from_title(str(row.get("title") or ""))
+            and not row.get("is_automation_target")
+        )
+    )]
+    return sorted(candidates, key=lambda row: (
+        -int(row.get("activity_at_ms") or 0), str(row["id"]),
+    ))[:RECENT_TASK_LIMIT]
+
+
+def listed_tasks(threads: list[dict[str, Any]], state: dict[str, Any]) -> list[dict[str, Any]]:
+    if push_mode(state) == "recent":
+        return select_recent_threads(threads)
+    return [row for row in threads if bool(row.get("is_pinned"))]
 
 
 def read_desktop_thread(config: dict[str, Any], thread_id: str) -> dict[str, Any] | None:
@@ -564,7 +623,8 @@ def recover_interrupted_reply_requests(
     recovered = 0
     requeued = 0
     for item in list(state.get("reply_queue", [])):
-        if item.get("status") not in {"running", "promoting", "dispatching"}:
+        original_status = item.get("status")
+        if original_status not in {"running", "promoting", "dispatching", "queued"}:
             continue
         if item.get("status") == "promoting" and item.get("native_message_id"):
             item["status"] = "native_queuing"
@@ -590,7 +650,7 @@ def recover_interrupted_reply_requests(
                 turn_id,
             )
             recovered += 1
-        else:
+        elif original_status != "queued":
             item["status"] = "queued"
             logger.info(
                 "Requeued interrupted WeChat reply thread=%s request=%s",
@@ -674,6 +734,8 @@ def read_pinned_thread_ids(config: dict[str, Any]) -> list[str] | None:
 
 
 def thread_push_is_enabled(thread: dict[str, Any], state: dict[str, Any]) -> bool:
+    if push_mode(state) == "recent":
+        return bool(thread.get("is_recent"))
     if bool(thread.get("is_pinned")):
         return True
     return bool(state.get("pinned_project_push_enabled", False)) and bool(
@@ -850,25 +912,33 @@ def format_pinned_task_status(
     active_sessions: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     threads = read_desktop_threads(config)
-    pinned = [thread for thread in threads if bool(thread.get("is_pinned"))]
+    pinned = listed_tasks(threads, state)
+    recent_mode = push_mode(state) == "recent"
+    if recent_mode:
+        state["recent_task_order"] = [str(thread["id"]) for thread in pinned]
     project_count = sum(bool(thread.get("is_project_pinned")) for thread in threads)
     pinned_push = bool(state.get("push_enabled", True))
     project_push = bool(state.get("pinned_project_push_enabled", False))
-    pinned_line = f"置顶任务回复推送：{'已开启' if pinned_push else '已关闭'}"
+    pinned_line = f"{push_mode_label(state)}回复推送：{'已开启' if pinned_push else '已关闭'}"
     project_line = (
         f"置顶文件夹任务回复推送：{'已开启' if project_push else '已关闭'}"
         + (f"（当前 {project_count} 个对话）" if project_push else "")
     )
+    if recent_mode:
+        project_line = "置顶文件夹任务回复推送：仅置顶模式生效"
     quota_lines = format_cached_quota_status(config, state)
     if not pinned:
         return (
             f"{quota_lines}\n{WECHAT_BLANK_LINE}\n{pinned_line}\n{project_line}"
-            f"\n{WECHAT_BLANK_LINE}\n当前没有单独置顶任务。"
+            f"\n{WECHAT_BLANK_LINE}\n"
+            + ("当前没有可用的活跃任务。" if recent_mode else "当前没有单独置顶任务。")
         )
     active_sessions = active_sessions or {}
     now = time.time()
     automation_runtimes: dict[str, dict[str, Any]] = {}
-    for run in read_pinned_automation_runs(config):
+    for run in read_automation_runs(config):
+        if str(run.get("route_thread_id")) not in {str(row["id"]) for row in pinned}:
+            continue
         runtime = latest_thread_runtime(str(run.get("rollout_path") or ""))
         if not runtime.get("active"):
             continue
@@ -884,7 +954,7 @@ def format_pinned_task_status(
         pinned_line,
         project_line,
         WECHAT_BLANK_LINE,
-        f"置顶任务（{len(pinned)}）",
+        f"{'近10条活跃任务' if recent_mode else '置顶任务'}（{len(pinned)}）",
     ]
     for index, thread in enumerate(pinned, 1):
         thread_id = str(thread["id"])
@@ -912,6 +982,8 @@ def format_pinned_task_status(
         if queued:
             status_text += f"｜排队 {queued}"
         lines.append(f"{index}. 【{title}】{status_text}")
+    if recent_mode:
+        lines.append("编号对应本次列表；再次发送 /rw 可刷新。")
     return "\n".join(lines)
 
 
@@ -929,8 +1001,8 @@ def baseline_state(state: dict[str, Any], threads: list[dict[str, Any]]) -> None
     state["initialized_at"] = int(time.time())
 
 
-def scan_rollout(path: Path, offset: int) -> tuple[int, list[dict[str, str]]]:
-    events: list[dict[str, str]] = []
+def scan_rollout(path: Path, offset: int) -> tuple[int, list[dict[str, Any]]]:
+    events: list[dict[str, Any]] = []
     try:
         size = path.stat().st_size
     except OSError:
@@ -962,7 +1034,10 @@ def scan_rollout(path: Path, offset: int) -> tuple[int, list[dict[str, str]]]:
             if not turn_id:
                 seed = f"{payload.get('completed_at', '')}\n{answer}".encode("utf-8")
                 turn_id = hashlib.sha256(seed).hexdigest()
-            events.append({"turn_id": str(turn_id), "answer": answer.strip()})
+            events.append({
+                "turn_id": str(turn_id), "answer": answer.strip(),
+                "completed_at": parse_event_time(item.get("timestamp")),
+            })
 
 
 def pending_turn_ids(state: dict[str, Any]) -> set[str]:
@@ -1022,7 +1097,7 @@ def poll_threads(
 
         if not bool(state.get("push_enabled", True)):
             continue
-        if bool(thread.get("is_automation_run")):
+        if bool(thread.get("is_automation_run")) and push_mode(state) == "pinned":
             if not bool(thread.get("is_pinned")):
                 continue
         elif not thread_push_is_enabled(thread, state):
@@ -1030,6 +1105,9 @@ def poll_threads(
         route_thread_id = str(thread.get("route_thread_id") or thread_id)
         title = str(thread.get("title") or "未命名任务").strip()
         for event in events:
+            if (push_mode(state) == "recent" and event.get("completed_at") is not None
+                    and event["completed_at"] < float(state.get("recent_mode_started_at") or 0)):
+                continue
             turn_id = event["turn_id"]
             if turn_id in sent or turn_id in known_pending:
                 continue
@@ -1045,6 +1123,9 @@ def poll_threads(
                     "next_retry_at": 0,
                     "queued_at": int(time.time()),
                     "pin_source": (
+                        "recent"
+                        if push_mode(state) == "recent"
+                        else
                         "pinned_automation"
                         if bool(thread.get("is_automation_run"))
                         else (
@@ -1057,7 +1138,7 @@ def poll_threads(
             )
             known_pending.add(turn_id)
             added += 1
-            logger.info("Queued completed pinned turn thread=%s turn=%s", thread_id, turn_id)
+            logger.info("Queued completed turn mode=%s thread=%s turn=%s", push_mode(state), thread_id, turn_id)
 
     # Keep offsets for monitored source threads plus pending source threads.
     pending_threads = {
@@ -1865,6 +1946,10 @@ def enqueue_desktop_queued_follow_up(
         return False, 0, str(exc), []
 
 
+def native_queue_outcome_unknown(detail: str) -> bool:
+    return "Codex Desktop queue submission outcome unknown:" in detail
+
+
 def remove_desktop_queued_follow_up(
     config: dict[str, Any], thread_id: str, native_message_id: str
 ) -> tuple[bool, bool, str]:
@@ -1890,9 +1975,18 @@ def format_queue_acknowledgement(
     ahead: int,
     queue_items: list[dict[str, Any]],
     max_chars: int,
+    *,
+    submitted: bool = True,
 ) -> str:
-    header = (
+    receipt = (
         f"收到，已提交【{title}】，排队中（前方{ahead}条）。\n"
+        if submitted
+        else (
+            f"收到，已保存给【{title}】的消息，等待转交 Codex（前方{ahead}条）。\n"
+            "尚未确认提交，将自动重试，请勿重复发送。\n"
+        )
+    )
+    header = receipt + (
         f'引用这条提示回复"/y"直接提交本条消息。\n{WECHAT_BLANK_LINE}\n'
         "当前队列："
     )
@@ -2015,6 +2109,11 @@ def promote_queued_reply(
         title = clean_chat_title(str(item.get("title") or route.get("title") or "未命名任务"))
         if item.get("status") in {"running", "promoting"}:
             return 200, f"【{title}】这条消息已在提交中。"
+        if item.get("status") == "native_queuing":
+            return 200, (
+                f"【{title}】正在确认是否已进入 Codex 队列；"
+                "为避免重复提交，请稍后再试。"
+            )
         native_queued = item.get("status") in {
             "desktop_queued",
             "native_queuing",
@@ -2065,7 +2164,7 @@ def promote_queued_reply(
                 save_state(state_path, state)
             return 200, "这条排队消息已提交、处理完成或已从 Codex 队列删除。"
 
-    ok, _ = submit_desktop_reply(config, thread_id, reply)
+    ok, detail = submit_desktop_reply(config, thread_id, reply)
     native_requeued = False
     native_detail = ""
     if not ok and native_queued:
@@ -2098,16 +2197,31 @@ def promote_queued_reply(
             )
             save_state(state_path, state)
             return 200, f"收到，已直接提交给【{title}】。"
+        native_unknown = not native_requeued and native_queue_outcome_unknown(native_detail)
         if item is not None:
-            item["status"] = "desktop_queued" if native_requeued else "queued"
-            item["mode"] = "queue" if native_requeued else "direct"
+            item["status"] = (
+                "desktop_queued" if native_requeued
+                else "native_queuing" if native_unknown else "queued"
+            )
+            item["mode"] = "queue" if native_requeued or native_unknown else "direct"
             item["next_retry_at"] = 0
+            item["direct_submit_error"] = detail[-500:]
+            if native_unknown:
+                item["native_queuing_at"] = int(time.time())
             if native_detail and not native_requeued:
                 item["native_queue_error"] = native_detail[-500:]
         save_state(state_path, state)
     if native_requeued:
         return 200, f"【{title}】直接提交未成功，已重新加入 Codex 排队队列。"
-    return 200, f"【{title}】直接提交未成功，已优先排队。"
+    if native_unknown:
+        return 200, (
+            f"【{title}】直接提交未成功，重新排队的结果正在等待 Codex 确认；"
+            "消息已保存，确认前不会重复提交，请勿重复发送。"
+        )
+    return 200, (
+        f"【{title}】直接提交未成功；消息已保存在通知器优先队列，"
+        "等待转交 Codex，将自动重试，请勿重复发送。"
+    )
 
 
 def remember_wechat_session(state: dict[str, Any], payload: dict[str, Any]) -> bool:
@@ -2215,14 +2329,15 @@ def enqueue_quote_reply(
             save_state(state_path, state)
         thread_id = str(route["thread_id"])
 
+    # A saved notification identifies the explicit reply target. Push mode
+    # selects unsolicited notifications, not whether an old quote can be used.
     thread = read_desktop_thread(config, thread_id)
     if (
         thread is None
-        or not thread_push_is_enabled(thread, state)
         or bool(thread.get("archived"))
         or thread.get("thread_source") not in {"user", "automation"}
     ):
-        return 409, "这个 Codex 任务已不在允许推送的置顶范围内或已经归档，未继续回复。"
+        return 409, "这个 Codex 任务已归档、已删除或不可用，未继续回复。"
 
     return enqueue_thread_reply(
         config,
@@ -2274,7 +2389,21 @@ def enqueue_pinned_task_reply(
             item.get("request_id") == request_id for item in state["reply_queue"]
         ):
             return 200, "收到"
-    pinned = [thread for thread in read_desktop_threads(config) if bool(thread.get("is_pinned"))]
+        selection_state = {
+            "push_mode": push_mode(state),
+            "recent_task_order": list(state.get("recent_task_order") or []),
+        }
+    if push_mode(selection_state) == "recent":
+        order = selection_state["recent_task_order"]
+        if not order or pinned_index > len(order):
+            return 404, "编号无效，请先发送 /rw 查看当前活跃任务。"
+        thread = read_desktop_thread(config, str(order[pinned_index - 1]))
+        if thread is None or thread.get("archived") or thread.get("thread_source") not in {"user", "automation"}:
+            return 409, "这个任务已归档或不可用，请发送 /rw 刷新列表。"
+        pinned = [thread]
+        pinned_index = 1
+    else:
+        pinned = listed_tasks(read_desktop_threads(config), selection_state)
     if pinned_index > len(pinned):
         return 404, "编号无效，请先发送 /rw 查看当前置顶任务。"
     thread = pinned[pinned_index - 1]
@@ -2321,6 +2450,7 @@ def enqueue_thread_reply(
             ):
                 return 200, "收到"
             direct_item = {
+                "accepted_push_mode": push_mode(state),
                 "request_id": request_id,
                 "message_id": message_id,
                 "thread_id": thread_id,
@@ -2361,8 +2491,12 @@ def enqueue_thread_reply(
             if item is not None:
                 item["status"] = "queued"
                 item["next_retry_at"] = 0
+                item["direct_submit_error"] = detail[-500:]
             save_state(state_path, state)
-        return 200, f"【{title}】直接提交未成功，已优先排队。"
+        return 200, (
+            f"【{title}】直接提交未成功；消息已保存在通知器优先队列，"
+            "等待转交 Codex，将自动重试，请勿重复发送。"
+        )
 
     runtime = latest_thread_runtime(str(thread.get("rollout_path") or ""))
     queued_at = int(time.time())
@@ -2376,6 +2510,7 @@ def enqueue_thread_reply(
         ):
             return 200, "收到"
         item = {
+            "accepted_push_mode": push_mode(state),
             "request_id": request_id,
             "message_id": message_id,
             "thread_id": thread_id,
@@ -2383,6 +2518,7 @@ def enqueue_thread_reply(
             "reply": reply_text,
             "mode": mode,
             "status": "native_queuing",
+            "native_queuing_at": queued_at,
             "native_message_id": native_message_id,
             "attempts": 0,
             "next_retry_at": 0,
@@ -2421,9 +2557,16 @@ def enqueue_thread_reply(
             item["status"] = "desktop_queued"
             item["native_message_id"] = native_detail
         else:
-            item["status"] = "queued"
+            item["status"] = (
+                "native_queuing" if native_queue_outcome_unknown(native_detail) else "queued"
+            )
             item["native_queue_error"] = native_detail[-500:]
         save_state(state_path, state)
+        if not native_ok and native_queue_outcome_unknown(native_detail):
+            return 200, (
+                f"收到，给【{title}】的消息正在等待 Codex 确认；"
+                "消息已保存，确认前不会重复提交，请勿重复发送。"
+            )
         wechat_ahead = sum(
             1
             for item in state["reply_queue"]
@@ -2464,6 +2607,7 @@ def enqueue_thread_reply(
             ahead,
             queue_items,
             int(config.get("max_message_chars", 3400)),
+            submitted=native_ok,
         )
         with state_lock:
             remember_queue_ack_route(
@@ -2475,7 +2619,52 @@ def enqueue_thread_reply(
             )
             save_state(state_path, state)
         return 200, response
-    return 200, f"收到，已提交【{title}】。"
+    if native_ok:
+        return 200, f"收到，已提交【{title}】。"
+    return 200, (
+        f"收到，已保存给【{title}】的消息，等待转交 Codex；"
+        "尚未确认提交，将自动重试，请勿重复发送。"
+    )
+
+
+def set_push_mode(
+    config: dict[str, Any], state: dict[str, Any], state_path: Path,
+    state_lock: threading.RLock, payload: dict[str, Any],
+) -> tuple[int, str]:
+    requested = str(payload.get("mode") or "").strip().lower()
+    if requested not in {"", "pinned", "recent"}:
+        return 400, "用法：/rwmode 切换模式；/rwmode pinned 置顶任务；/rwmode recent 近10条活跃任务。"
+    message_id = str(payload.get("message_id") or "").strip()
+    user_id = str(payload.get("user_id") or "").strip()
+    request_id = f"mode|{user_id}|{message_id}" if message_id else ""
+    with state_lock:
+        duplicate = request_id and request_id in state["handled_message_ids"]
+        current = push_mode(state)
+        target = requested or ("recent" if current == "pinned" else "pinned")
+        if not duplicate and target != current:
+            # Preserve completions eligible in the old mode, then start the new
+            # scope at current offsets without replaying older answers.
+            if state.get("initialized"):
+                poll_threads(config, state, logging.getLogger("codex_pinned_wechat_notifier"))
+            threads = read_monitored_threads(config, state)
+            baseline_state(state, threads)
+            state["automation_runs_initialized"] = True
+            for item in state["reply_queue"]:
+                item.setdefault("accepted_push_mode", current)
+            state["push_mode"] = target
+            if target == "recent":
+                state["recent_mode_started_at"] = time.time()
+            state["recent_task_order"] = []
+        remember_wechat_session(state, payload)
+        if request_id:
+            state["handled_message_ids"][request_id] = int(time.time())
+            state["handled_message_ids"] = trim_timestamp_dict(
+                state["handled_message_ids"], int(config.get("handled_message_history_limit", 2000)),
+            )
+        message = f"当前推送模式：{push_mode_label(state)}\n{WECHAT_BLANK_LINE}\n"
+        message += format_pinned_task_status(config, state)
+        save_state(state_path, state)
+    return 200, message
 
 
 def toggle_pinned_push(
@@ -2492,7 +2681,7 @@ def toggle_pinned_push(
         remember_wechat_session(state, payload)
         if request_id and request_id in state["handled_message_ids"]:
             enabled = bool(state.get("push_enabled", True))
-            return 200, f"置顶任务回复推送已{'开启' if enabled else '关闭'}"
+            return 200, f"{push_mode_label(state)}回复推送已{'开启' if enabled else '关闭'}"
         enabled = not bool(state.get("push_enabled", True))
         state["push_enabled"] = enabled
         if not enabled:
@@ -2505,7 +2694,7 @@ def toggle_pinned_push(
                 int(config.get("handled_message_history_limit", 2000)),
             )
         save_state(state_path, state)
-    return 200, f"置顶任务回复推送已{'开启' if enabled else '关闭'}"
+    return 200, f"{push_mode_label(state)}回复推送已{'开启' if enabled else '关闭'}"
 
 
 def toggle_pinned_project_push(
@@ -2519,6 +2708,8 @@ def toggle_pinned_project_push(
     user_id = str(payload.get("user_id") or "").strip()
     request_id = f"project-push-toggle|{user_id}|{message_id}" if message_id else ""
     with state_lock:
+        if push_mode(state) == "recent":
+            return 200, "当前是近10条活跃任务模式；/rwfolder 仅在置顶模式生效。发送 /rwmode pinned 可切回置顶模式。"
         remember_wechat_session(state, payload)
         if request_id and request_id in state["handled_message_ids"]:
             enabled = bool(state.get("pinned_project_push_enabled", False))
@@ -2553,6 +2744,7 @@ def health_status(config: dict[str, Any], state: dict[str, Any]) -> dict[str, An
         ),
         "queued_wechat_replies": len(state.get("reply_queue", [])),
         "push_enabled": bool(state.get("push_enabled", True)),
+        "push_mode": push_mode(state),
         "pinned_project_push_enabled": bool(
             state.get("pinned_project_push_enabled", False)
         ),
@@ -2687,6 +2879,7 @@ class QuoteRouterHandler(BaseHTTPRequestHandler):
             "/toggle",
             "/folder-toggle",
             "/task",
+            "/mode",
         }:
             self._respond(404, {"handled": False, "message": "not found"})
             return
@@ -2720,7 +2913,13 @@ class QuoteRouterHandler(BaseHTTPRequestHandler):
                     message = format_pinned_task_status(
                         router.config, router.state, sessions
                     )
+                    save_state(router.state_path, router.state)
                 status_code = 200
+            elif self.path == "/mode":
+                status_code, message = set_push_mode(
+                    router.config, router.state, router.state_path,
+                    router.state_lock, payload,
+                )
             elif self.path == "/toggle":
                 status_code, message = toggle_pinned_push(
                     router.config,
@@ -2919,6 +3118,7 @@ def reconcile_desktop_queued_replies(
                 "status": str(item.get("status") or ""),
                 "reply": str(item.get("reply") or ""),
                 "queued_at": int(item.get("queued_at") or 0),
+                "native_queuing_at": int(item.get("native_queuing_at") or item.get("queued_at") or 0),
             }
             for item in state.get("reply_queue", [])
             if item.get("status") in {"desktop_queued", "native_queuing"}
@@ -2965,7 +3165,7 @@ def reconcile_desktop_queued_replies(
 
         turn_id = ""
         if snapshot["status"] == "native_queuing":
-            queued_at = snapshot["queued_at"]
+            queued_at = snapshot["native_queuing_at"]
             if queued_at > 0 and now - queued_at < native_enqueue_grace:
                 continue
             thread = read_desktop_thread(config, thread_id)
@@ -3043,7 +3243,7 @@ def run_reply_worker(
     thread = read_desktop_thread(config, thread_id)
     if (
         thread is None
-        or not thread_push_is_enabled(thread, state)
+        or (not item.get("accepted_push_mode") and not thread_push_is_enabled(thread, state))
         or bool(thread.get("archived"))
     ):
         ok, detail = False, "target task is no longer in the enabled pinned scope"

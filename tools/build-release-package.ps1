@@ -2,10 +2,10 @@
 param(
     [Parameter(Mandatory)]
     [string]$CcConnectSourceRoot,
-    [string]$NotifierVersion = '1.2.0',
+    [string]$NotifierVersion = '1.4.0',
     [string]$CcConnectBaseVersion = '1.4.1',
     [ValidateRange(1, 9999)]
-    [int]$CcConnectPatchVersion = 15,
+    [int]$CcConnectPatchVersion = 16,
     [string]$OutputRoot = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist'),
     [string]$GoPath = '',
     [string]$GoToolchain = 'go1.25.0',

@@ -10,15 +10,29 @@ from urllib.parse import urlsplit
 from websocket_transport import WebSocketConnection
 
 
-DESKTOP_REQUEST_CLIENT_LOOKUP = r"""
-  function findDesktopRequestClient() {
+DESKTOP_OBJECT_LOOKUP = r"""
+  function findDesktopObject(predicate, description) {
     const root = window.__codexRoot?._internalRoot?.current;
     if (!root) throw new Error('Codex Desktop React root was not found');
-    const queue = [root];
+    const deadline = Date.now() + 2500;
+    // Start with live component state, not the DOM/history graph hanging off
+    // the root. The latter can exceed hundreds of thousands of objects.
+    const fibers = [root], fiberSeen = new WeakSet(), queue = [];
+    for (let i = 0; i < fibers.length && i < 50000; i++) {
+      if ((i & 255) === 0 && Date.now() > deadline) break;
+      const fiber = fibers[i];
+      if (!fiber || typeof fiber !== 'object' || fiberSeen.has(fiber)) continue;
+      fiberSeen.add(fiber);
+      queue.push(fiber.memoizedState, fiber.memoizedProps, fiber.dependencies);
+      if (fiber.child) fibers.push(fiber.child);
+      if (fiber.sibling) fibers.push(fiber.sibling);
+    }
+    queue.push(root);
     const seen = new WeakSet();
     let cursor = 0;
     let visited = 0;
-    while (cursor < queue.length && visited < 200000) {
+    while (cursor < queue.length && visited < 750000) {
+      if ((cursor & 255) === 0 && Date.now() > deadline) break;
       const value = queue[cursor++];
       if (
         value == null ||
@@ -28,12 +42,11 @@ DESKTOP_REQUEST_CLIENT_LOOKUP = r"""
       seen.add(value);
       visited += 1;
       try {
-        if (
-          typeof value.sendRequest === 'function' &&
-          value.hostId === 'local' &&
-          value.requestPromises instanceof Map
-        ) return value;
+        if (predicate(value)) return value;
       } catch {}
+      // DOM nodes and binary buffers cannot own the app services we need.
+      if (ArrayBuffer.isView(value) ||
+          (typeof Node === 'function' && value instanceof Node)) continue;
       let descriptors;
       try {
         descriptors = Object.getOwnPropertyDescriptors(value);
@@ -46,41 +59,48 @@ DESKTOP_REQUEST_CLIENT_LOOKUP = r"""
         if (
           child != null &&
           (typeof child === 'object' || typeof child === 'function')
-        ) queue.push(child);
+        ) {
+          if (queue.length >= 2000000) break;
+          queue.push(child);
+        }
       }
       if (value instanceof Map) {
-        for (const [key, child] of value) queue.push(key, child);
+        for (const [key, child] of value) {
+          if (queue.length >= 2000000) break;
+          queue.push(key, child);
+        }
       } else if (value instanceof Set) {
-        for (const child of value) queue.push(child);
+        for (const child of value) {
+          if (queue.length >= 2000000) break;
+          queue.push(child);
+        }
       }
     }
-    throw new Error('Codex Desktop AppServer request client was not found');
+    const limited = cursor < queue.length;
+    throw new Error('Codex Desktop ' + description + ' was not found' +
+      (limited ? ' (safe lookup budget exceeded)' : ''));
+  }
+""".strip()
+
+
+DESKTOP_REQUEST_CLIENT_LOOKUP = r"""
+  function findDesktopRequestClient() {
+    return findDesktopObject((value) => (
+      typeof value.sendRequest === 'function' &&
+      value.hostId === 'local' && value.requestPromises instanceof Map
+    ), 'AppServer request client');
   }
 """.strip()
 
 
 DESKTOP_QUEUED_FOLLOW_UP_LOOKUP = r"""
   function findDesktopQueuedFollowUpsContext() {
-    const root = window.__codexRoot?._internalRoot?.current;
-    if (!root) throw new Error('Codex Desktop React root was not found');
-    const queue = [root];
-    const seen = new WeakSet();
-    let cursor = 0;
-    let visited = 0;
-    while (cursor < queue.length && visited < 200000) {
-      const value = queue[cursor++];
-      if (
-        value == null ||
-        (typeof value !== 'object' && typeof value !== 'function') ||
-        seen.has(value)
-      ) continue;
-      seen.add(value);
-      visited += 1;
-      try {
-        if (typeof value.getQueryCache === 'function') {
-          const queries = value.getQueryCache().getAll();
-          if (Array.isArray(queries)) {
-            const query = queries.find((candidate) => {
+    let query;
+    const queryClient = findDesktopObject((value) => {
+      if (typeof value.getQueryCache === 'function') {
+        const queries = value.getQueryCache().getAll();
+        if (Array.isArray(queries)) {
+            query = queries.find((candidate) => {
               const key = candidate?.queryKey;
               return (
                 Array.isArray(key) &&
@@ -88,84 +108,176 @@ DESKTOP_QUEUED_FOLLOW_UP_LOOKUP = r"""
                 JSON.stringify(key).includes('queued-follow-ups')
               );
             });
-            if (query) return { query, queryClient: value };
-          }
+            return !!query;
         }
-      } catch {}
-      let descriptors;
-      try {
-        descriptors = Object.getOwnPropertyDescriptors(value);
-      } catch {
-        continue;
       }
-      for (const descriptor of Object.values(descriptors)) {
-        if (!Object.prototype.hasOwnProperty.call(descriptor, 'value')) continue;
-        const child = descriptor.value;
-        if (
-          child != null &&
-          (typeof child === 'object' || typeof child === 'function')
-        ) queue.push(child);
-      }
-      if (value instanceof Map) {
-        for (const [key, child] of value) queue.push(key, child);
-      } else if (value instanceof Set) {
-        for (const child of value) queue.push(child);
-      }
-    }
-    throw new Error('Codex Desktop queued follow-up cache was not found');
+      return false;
+    }, 'queued follow-up cache');
+    return { query, queryClient };
   }
 """.strip()
 
 
 DESKTOP_MANAGER_LOOKUP = r"""
   function findDesktopManager() {
-    const root = window.__codexRoot?._internalRoot?.current;
-    if (!root) throw new Error('Codex Desktop React root was not found');
-    const queue = [root];
-    const seen = new WeakSet();
-    let cursor = 0;
-    let visited = 0;
-    while (cursor < queue.length && visited < 200000) {
-      const value = queue[cursor++];
-      if (
-        value == null ||
-        (typeof value !== 'object' && typeof value !== 'function') ||
-        seen.has(value)
-      ) continue;
-      seen.add(value);
-      visited += 1;
-      try {
-        if (
-          typeof value.fetchFromHost === 'function' &&
-          value.hostId === 'local' &&
-          value.scope &&
-          value.threadStore &&
-          value.requestClient
-        ) return value;
-      } catch {}
-      let descriptors;
-      try {
-        descriptors = Object.getOwnPropertyDescriptors(value);
-      } catch {
-        continue;
-      }
-      for (const descriptor of Object.values(descriptors)) {
-        if (!Object.prototype.hasOwnProperty.call(descriptor, 'value')) continue;
-        const child = descriptor.value;
-        if (
-          child != null &&
-          (typeof child === 'object' || typeof child === 'function')
-        ) queue.push(child);
-      }
-      if (value instanceof Map) {
-        for (const [key, child] of value) queue.push(key, child);
-      } else if (value instanceof Set) {
-        for (const child of value) queue.push(child);
-      }
-    }
-    throw new Error('Codex Desktop local manager was not found');
+    return findDesktopObject((value) => (
+      value.hostId === 'local' && value.threadStore && value.requestClient && (
+        (typeof value.fetchFromHost === 'function' && value.scope) ||
+        (typeof value.storage?.loadQueuedFollowUps === 'function' &&
+         typeof value.storage?.updateQueuedFollowUps === 'function')
+      )
+    ), 'local manager');
   }
 """.strip()
+
+
+DESKTOP_QUEUE_ACCESS = r"""
+  async function queueMutation(operation) {
+    try { return await operation(); }
+    catch (error) {
+      throw new Error('Codex Desktop queue submission outcome unknown: ' + String(error));
+    }
+  }
+  function queuePreview(item) {
+    return {
+      id: String(item?.id ?? ''),
+      clientMessageId: String(item?.clientMessageId ?? ''),
+      text: String(item?.text ?? item?.context?.prompt ?? ''),
+      createdAt: Number(item?.createdAt ?? 0),
+    };
+  }
+  async function withBridgeQueueLock(threadId, operation) {
+    return globalThis.navigator?.locks
+      ? globalThis.navigator.locks.request('cc-connect-queue-' + threadId, operation)
+      : operation();
+  }
+  async function desktopQueueAccess(threadId) {
+    const manager = findDesktopManager();
+    const storage = manager.storage;
+    if (typeof storage?.loadQueuedFollowUps === 'function' &&
+        typeof storage?.updateQueuedFollowUps === 'function') {
+      const local = await storage.loadQueuedFollowUps();
+      const server = manager.turnCoordinator?.serverQueue;
+      if (server?.isEnabled(threadId) && !(local?.[threadId]?.length)) {
+        // Desktop 26.915+ owns this queue on the app server. Writing the old
+        // global-state key here would hide messages queued from Desktop.
+        const read = async () => {
+          await server.load(threadId);
+          const cached = new Map((server.read(threadId) ?? []).map(item => [item.id, item]));
+          const items = [], cursors = new Set();
+          let cursor = null;
+          do {
+            const page = await manager.requestClient.sendRequest('thread/queue/list',
+              { threadId, cursor }, { priority: 'critical', source: 'wechat_quote' });
+            if (!Array.isArray(page?.data)) throw new Error('Invalid Desktop server queue');
+            for (const raw of page.data) {
+              const item = cached.get(raw.id);
+              items.push({ ...item, id: String(raw.id),
+                clientMessageId: String(raw.clientUserMessageId ?? ''),
+                text: item?.text ?? (raw.input ?? []).map(part => part.text ?? '').join(''),
+                createdAt: Number(item?.createdAt ?? 0) });
+            }
+            cursor = page.nextCursor ?? null;
+            if (cursor !== null && (typeof cursor !== 'string' || cursors.has(cursor) || cursors.size >= 1000)) {
+              throw new Error('Invalid Desktop server queue pagination');
+            }
+            cursors.add(cursor);
+          } while (cursor !== null);
+          return items;
+        };
+        return {
+          read,
+          enqueue: message => withBridgeQueueLock(threadId, async () => {
+            const before = await read();
+            const existing = before.find(item => item.id === message.id || item.clientMessageId === message.id);
+            if (existing) return { inserted: false, id: existing.id, items: before };
+            // This explicit queue API never consults the user's send/steer default.
+            const result = await queueMutation(() => server.enqueue(threadId, message));
+            if (result?.status !== 'queued' || !result.messageId) {
+              throw new Error('Codex Desktop queue submission outcome unknown: server acknowledgement missing');
+            }
+            // A successfully accepted item may already have started or the
+            // subsequent read may fail. Neither means it is safe to resubmit.
+            const accepted = { ...message, id: result.messageId, clientMessageId: message.id };
+            let items;
+            try { items = await read(); } catch { items = before; }
+            if (!items.some(item => item.id === result.messageId)) items = [...items, accepted];
+            return { inserted: true, id: result.messageId, items };
+          }),
+          remove: id => withBridgeQueueLock(threadId, async () => {
+            const before = await read();
+            const item = before.find(item => item.id === id || item.clientMessageId === id);
+            if (!item) return { removed: false, count: before.length };
+            const removed = await server.remove(threadId, item.id);
+            return { removed: removed != null, count: Math.max(0, before.length - (removed != null ? 1 : 0)) };
+          }),
+        };
+      }
+      // Earlier Desktop versions use persisted local queues. The storage
+      // callback already acquires codex-queued-follow-up-state; do not nest it.
+      return localQueueAccess(threadId,
+        () => storage.loadQueuedFollowUps(),
+        transform => storage.updateQueuedFollowUps(transform));
+    }
+    const { query, queryClient } = findDesktopQueuedFollowUpsContext();
+    const read = async () => (await manager.fetchFromHost('get-global-state',
+      { params: { key: 'queued-follow-ups' } }))?.value ?? {};
+    const update = async transform => {
+      const operation = async () => {
+        const before = await read();
+        const next = transform(before);
+        if (next !== before) {
+          const saved = await manager.fetchFromHost('set-global-state',
+            { params: { key: 'queued-follow-ups', value: next } });
+          if (saved?.success !== true) throw new Error('Codex Desktop did not persist the queued follow-up');
+        }
+        queryClient.setQueryData(query.queryKey, { value: next });
+      };
+      return globalThis.navigator?.locks
+        ? globalThis.navigator.locks.request('codex-queued-follow-up-state', operation)
+        : operation();
+    };
+    return localQueueAccess(threadId, read, update);
+  }
+  function localQueueAccess(threadId, readState, updateState) {
+    return {
+      read: async () => (await readState())?.[threadId] ?? [],
+      enqueue: async message => {
+        let items, inserted = false;
+        await queueMutation(() => updateState(state => {
+          state = state ?? {};
+          const current = state[threadId] ?? [];
+          inserted = !current.some(item => item.id === message.id);
+          items = inserted ? [...current, message] : current;
+          return inserted ? { ...state, [threadId]: items } : state;
+        }));
+        if (!items) throw new Error('Codex Desktop queue submission outcome unknown: update not confirmed');
+        return { inserted, id: message.id, items };
+      },
+      remove: async id => {
+        let items, removed = false;
+        await updateState(state => {
+          state = state ?? {};
+          const current = state[threadId] ?? [];
+          items = current.filter(item => item.id !== id);
+          removed = items.length !== current.length;
+          if (!removed) return state;
+          const next = { ...state };
+          if (items.length) next[threadId] = items;
+          else delete next[threadId];
+          return next;
+        });
+        if (!items) throw new Error('Desktop queue removal was not confirmed');
+        return { removed, count: items.length };
+      },
+    };
+  }
+""".strip()
+
+
+def queue_lookup_code() -> str:
+    return "\n".join((DESKTOP_OBJECT_LOOKUP, DESKTOP_MANAGER_LOOKUP,
+                      DESKTOP_QUEUED_FOLLOW_UP_LOOKUP, DESKTOP_QUEUE_ACCESS))
 
 
 def validate_loopback_http_url(url: str) -> tuple[str, int]:
@@ -221,6 +333,7 @@ def build_follow_up_expression(
     )
     return f"""
 (async () => {{
+  {DESKTOP_OBJECT_LOOKUP}
   {DESKTOP_REQUEST_CLIENT_LOOKUP}
   const request = findDesktopRequestClient();
   const payload = {payload};
@@ -247,6 +360,7 @@ def build_follow_up_expression(
 def build_probe_expression() -> str:
     return f"""
 (async () => {{
+  {DESKTOP_OBJECT_LOOKUP}
   {DESKTOP_REQUEST_CLIENT_LOOKUP}
   const request = findDesktopRequestClient();
   return {{
@@ -261,14 +375,13 @@ def build_probe_expression() -> str:
 def build_queued_follow_up_count_expression(thread_id: str) -> str:
     encoded_thread_id = json.dumps(thread_id, ensure_ascii=True)
     return f"""
-(() => {{
-  {DESKTOP_QUEUED_FOLLOW_UP_LOOKUP}
-  const {{ query }} = findDesktopQueuedFollowUpsContext();
-  const queuedByThread = query?.state?.data?.value;
-  const queuedForThread = queuedByThread?.[{encoded_thread_id}];
+(async () => {{
+  {queue_lookup_code()}
+  const access = await desktopQueueAccess({encoded_thread_id});
+  const items = await access.read();
   return {{
     ok: true,
-    queuedCount: Array.isArray(queuedForThread) ? queuedForThread.length : 0,
+    queuedCount: items.length,
   }};
 }})()
 """.strip()
@@ -277,16 +390,13 @@ def build_queued_follow_up_count_expression(thread_id: str) -> str:
 def build_queued_follow_up_ids_expression(thread_id: str) -> str:
     encoded_thread_id = json.dumps(thread_id, ensure_ascii=True)
     return f"""
-(() => {{
-  {DESKTOP_QUEUED_FOLLOW_UP_LOOKUP}
-  const {{ query }} = findDesktopQueuedFollowUpsContext();
-  const queuedByThread = query?.state?.data?.value;
-  const queuedForThread = queuedByThread?.[{encoded_thread_id}];
+(async () => {{
+  {queue_lookup_code()}
+  const access = await desktopQueueAccess({encoded_thread_id});
+  const items = await access.read();
   return {{
     ok: true,
-    queuedIds: Array.isArray(queuedForThread)
-      ? queuedForThread.map((item) => String(item?.id ?? '')).filter(Boolean)
-      : [],
+    queuedIds: [...new Set(items.flatMap(item => [item.id, item.clientMessageId]).filter(Boolean))],
   }};
 }})()
 """.strip()
@@ -295,20 +405,13 @@ def build_queued_follow_up_ids_expression(thread_id: str) -> str:
 def build_queued_follow_up_items_expression(thread_id: str) -> str:
     encoded_thread_id = json.dumps(thread_id, ensure_ascii=True)
     return f"""
-(() => {{
-  {DESKTOP_QUEUED_FOLLOW_UP_LOOKUP}
-  const {{ query }} = findDesktopQueuedFollowUpsContext();
-  const queuedByThread = query?.state?.data?.value;
-  const queuedForThread = queuedByThread?.[{encoded_thread_id}];
+(async () => {{
+  {queue_lookup_code()}
+  const access = await desktopQueueAccess({encoded_thread_id});
+  const items = await access.read();
   return {{
     ok: true,
-    queuedItems: Array.isArray(queuedForThread)
-      ? queuedForThread.map((item) => ({{
-          id: String(item?.id ?? ''),
-          text: String(item?.text ?? item?.context?.prompt ?? ''),
-          createdAt: Number(item?.createdAt ?? 0),
-        }}))
-      : [],
+    queuedItems: items.map(queuePreview),
   }};
 }})()
 """.strip()
@@ -356,48 +459,17 @@ def build_enqueue_queued_follow_up_expression(
     )
     return f"""
 (async () => {{
-  {DESKTOP_QUEUED_FOLLOW_UP_LOOKUP}
-  {DESKTOP_MANAGER_LOOKUP}
+  {queue_lookup_code()}
   const payload = {payload};
-  const operation = async () => {{
-    const manager = findDesktopManager();
-    const {{ query, queryClient }} = findDesktopQueuedFollowUpsContext();
-    const fetched = await manager.fetchFromHost(
-      'get-global-state',
-      {{ params: {{ key: 'queued-follow-ups' }} }}
-    );
-    const queuedByThread = {{ ...(fetched?.value ?? {{}}) }};
-    const current = Array.isArray(queuedByThread[payload.threadId])
-      ? queuedByThread[payload.threadId]
-      : [];
-    const existing = current.find((item) => item?.id === payload.message.id);
-    const messages = existing ? current : [...current, payload.message];
-    const next = {{ ...queuedByThread, [payload.threadId]: messages }};
-    if (!existing) {{
-      const saved = await manager.fetchFromHost(
-        'set-global-state',
-        {{ params: {{ key: 'queued-follow-ups', value: next }} }}
-      );
-      if (saved?.success !== true) {{
-        throw new Error('Codex Desktop did not persist the queued follow-up');
-      }}
-    }}
-    queryClient.setQueryData(query.queryKey, {{ value: next }});
-    return {{
+  const access = await desktopQueueAccess(payload.threadId);
+  const result = await access.enqueue(payload.message);
+  return {{
       ok: true,
-      inserted: !existing,
-      queuedMessageId: payload.message.id,
-      queuedCount: messages.length,
-      queuedItems: messages.map((item) => ({{
-        id: String(item?.id ?? ''),
-        text: String(item?.text ?? item?.context?.prompt ?? ''),
-        createdAt: Number(item?.createdAt ?? 0),
-      }})),
-    }};
+      inserted: result.inserted,
+      queuedMessageId: result.id,
+      queuedCount: result.items.length,
+      queuedItems: result.items.map(queuePreview),
   }};
-  return globalThis.navigator?.locks
-    ? globalThis.navigator.locks.request('codex-queued-follow-up-state', operation)
-    : operation();
 }})()
 """.strip()
 
@@ -412,42 +484,11 @@ def build_remove_queued_follow_up_expression(
     )
     return f"""
 (async () => {{
-  {DESKTOP_QUEUED_FOLLOW_UP_LOOKUP}
-  {DESKTOP_MANAGER_LOOKUP}
+  {queue_lookup_code()}
   const payload = {payload};
-  const operation = async () => {{
-    const manager = findDesktopManager();
-    const {{ query, queryClient }} = findDesktopQueuedFollowUpsContext();
-    const fetched = await manager.fetchFromHost(
-      'get-global-state',
-      {{ params: {{ key: 'queued-follow-ups' }} }}
-    );
-    const queuedByThread = {{ ...(fetched?.value ?? {{}}) }};
-    const current = Array.isArray(queuedByThread[payload.threadId])
-      ? queuedByThread[payload.threadId]
-      : [];
-    const messages = current.filter((item) => item?.id !== payload.messageId);
-    const removed = messages.length !== current.length;
-    if (!removed) {{
-      queryClient.setQueryData(query.queryKey, {{ value: queuedByThread }});
-      return {{ ok: true, removed: false, queuedCount: current.length }};
-    }}
-    const next = {{ ...queuedByThread }};
-    if (messages.length === 0) delete next[payload.threadId];
-    else next[payload.threadId] = messages;
-    const saved = await manager.fetchFromHost(
-      'set-global-state',
-      {{ params: {{ key: 'queued-follow-ups', value: next }} }}
-    );
-    if (saved?.success !== true) {{
-      throw new Error('Codex Desktop did not persist the queued follow-up removal');
-    }}
-    queryClient.setQueryData(query.queryKey, {{ value: next }});
-    return {{ ok: true, removed: true, queuedCount: messages.length }};
-  }};
-  return globalThis.navigator?.locks
-    ? globalThis.navigator.locks.request('codex-queued-follow-up-state', operation)
-    : operation();
+  const access = await desktopQueueAccess(payload.threadId);
+  const result = await access.remove(payload.messageId);
+  return {{ ok: true, removed: result.removed, queuedCount: result.count }};
 }})()
 """.strip()
 
@@ -607,11 +648,20 @@ class DesktopCdpClient:
         message_id: str,
         created_at_ms: int,
     ) -> dict[str, Any]:
-        return self.evaluate(
-            build_enqueue_queued_follow_up_expression(
-                thread_id, prompt, cwd, message_id, created_at_ms
+        try:
+            return self.evaluate(
+                build_enqueue_queued_follow_up_expression(
+                    thread_id, prompt, cwd, message_id, created_at_ms
+                )
             )
-        )
+        except (RuntimeError, TimeoutError) as exc:
+            # After dispatch, losing a CDP response is not proof that Desktop
+            # rejected the enqueue. Keep the stable client ID for reconciliation.
+            if isinstance(exc, TimeoutError) or "Codex Desktop CDP request failed" in str(exc):
+                raise RuntimeError(
+                    f"Codex Desktop queue submission outcome unknown: {exc}"
+                ) from exc
+            raise
 
     def remove_queued_follow_up(
         self, thread_id: str, message_id: str

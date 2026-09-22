@@ -5,11 +5,34 @@ Python notifier unless a cc-connect routing patch is named explicitly.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-23
+
+- Prioritize live React component state when locating Desktop services, with
+  bounded graph traversal instead of the insufficient 200,000-object scan.
+- Support Desktop server-side native queues and modern local queue storage,
+  including server/client message IDs, pagination, and deduplication. Preserve
+  legacy queues and keep explicit queue operations independent of send defaults.
+- Distinguish confirmed Desktop submission from saved-but-not-forwarded replies;
+  reconcile uncertain submissions before retrying to avoid duplicate delivery.
+- Keep saved notification quotes replyable across both push modes, including
+  after unpinning. Preserve archived/deleted task checks and keep automatic
+  notification eligibility separate from explicit quote reply routing.
+- Add `/rwmode pinned|recent` to select pinned tasks (the default) or the 10
+  most recently active unarchived user tasks, including idle tasks. Fold
+  automation executions into their targets and exclude subagent tasks.
+- Make `/rw` follow the selected mode. Recent-mode numbered replies use the
+  last returned list until refreshed; saved quotes can still reach tasks that
+  leave the recent top 10, while archived tasks remain unavailable.
+- Share `/rwpush` across both modes and retain `/rwfolder` only for pinned
+  mode. Mode changes preserve accepted instructions and notification backlogs
+  without replaying historical answers from newly selected tasks.
 - Identify 5-hour and 7-day quota windows by their reported duration, including
   weekly-only accounts with the weekly window in `primary`. Prefer the named
   Codex bucket and avoid mixing model-specific quotas into `/rw` or alerts.
 - Clear previously mislabeled alert stages on quota refresh.
 - Document sending `/rw` before use and the community-reported Weixin push limit.
+- Bundle the matching cc-connect `v1.4.1+qr16` routing companion, including
+  `/rwmode` commands and the updated localized `/hp` guide.
 
 ## [1.3.0] - 2026-08-30
 
@@ -73,7 +96,8 @@ Python notifier unless a cc-connect routing patch is named explicitly.
   installation.
 - Added the cc-connect `v1.4.1+qr3` routing companion.
 
-[Unreleased]: https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/releases/tag/v1.4.0
 [1.3.0]: https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/releases/tag/v1.3.0
 [1.2.1]: https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/releases/tag/v1.2.1
 [1.2.0]: https://github.com/JiaYang-BUAA/cc-connect-codex-wechat-router/releases/tag/v1.2.0

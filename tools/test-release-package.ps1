@@ -30,6 +30,25 @@ try {
             throw "Package input not found after extraction: $path"
         }
     }
+    $manifest = Get-Content -Raw -LiteralPath (Join-Path $package 'release-manifest.json') | ConvertFrom-Json
+    $notifierSource = Get-Content -Raw -LiteralPath (Join-Path $package 'notifier.py')
+    $versionMatch = [regex]::Match($notifierSource, '(?m)^NOTIFIER_VERSION\s*=\s*"([^"]+)"')
+    if (-not $versionMatch.Success -or
+        ([string]$manifest.notifier_version -replace '-ci$', '') -ne $versionMatch.Groups[1].Value) {
+        throw 'The bundled notifier version does not match the release manifest.'
+    }
+    if ([string]$manifest.cc_connect_source_commit -notmatch '^[a-f0-9]{40}$') {
+        throw 'The release manifest must identify an exact cc-connect source commit.'
+    }
+    $binaryHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $binary).Hash
+    if ($binaryHash -ne [string]$manifest.cc_connect_binary_sha256) {
+        throw 'The bundled binary does not match the release manifest checksum.'
+    }
+    $binaryVersion = (& $binary --version | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or
+        $binaryVersion -notmatch [regex]::Escape([string]$manifest.cc_connect_version)) {
+        throw 'The bundled cc-connect version does not match the release manifest.'
+    }
     $ccConfig = Join-Path $testRoot 'config.toml'
     @'
 language = "zh"

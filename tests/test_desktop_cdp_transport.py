@@ -144,7 +144,8 @@ class DesktopCdpTransportTests(unittest.TestCase):
         self.assertIn("findDesktopQueuedFollowUpsContext", expression)
         self.assertIn(json.dumps("thread-1"), expression)
         self.assertIn("queuedIds", expression)
-        self.assertNotIn("item?.text", expression)
+        self.assertIn("item.clientMessageId", expression)
+        self.assertNotIn("queuedItems:", expression)
 
     def test_queued_follow_up_items_expression_returns_ordered_previews(self):
         expression = build_queued_follow_up_items_expression("thread-1")
@@ -170,7 +171,7 @@ class DesktopCdpTransportTests(unittest.TestCase):
         self.assertIn("queryClient.setQueryData", expression)
         self.assertIn('"id":"message-1"', expression)
         self.assertIn('"prompt":' + json.dumps("继续处理", ensure_ascii=True), expression)
-        self.assertIn("queuedItems: messages.map", expression)
+        self.assertIn("queuedItems: result.items.map(queuePreview)", expression)
         self.assertNotIn("turn/start", expression)
 
     def test_remove_queued_follow_up_uses_native_state_and_cache(self):
